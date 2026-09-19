@@ -2,6 +2,7 @@
  * PersonaPulse – Telegram Webhook Handler
  * =========================================
  * Deno TypeScript Supabase Edge Function.
+ * 
  *
  * Receives Telegram callback_query webhook events triggered when a user
  * taps the inline ✅ Approve or ❌ Reject buttons in the approval message.
@@ -73,15 +74,15 @@ interface PublishResult {
 const FETCH_TIMEOUT_MS = 8_000;  // AbortSignal.timeout cap per spec
 
 const env = {
-  supabaseUrl:          Deno.env.get("SUPABASE_URL")!,
-  supabaseKey:          Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-  telegramBotToken:     Deno.env.get("TELEGRAM_BOT_TOKEN")!,
-  linkedinAccessToken:  Deno.env.get("LINKEDIN_ACCESS_TOKEN")!,
-  linkedinAuthorUrn:    Deno.env.get("LINKEDIN_AUTHOR_URN")!,
-  xApiKey:              Deno.env.get("X_API_KEY")!,
-  xApiSecret:           Deno.env.get("X_API_SECRET")!,
-  xAccessToken:         Deno.env.get("X_ACCESS_TOKEN")!,
-  xAccessSecret:        Deno.env.get("X_ACCESS_SECRET")!,
+  supabaseUrl: Deno.env.get("SUPABASE_URL")!,
+  supabaseKey: Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+  telegramBotToken: Deno.env.get("TELEGRAM_BOT_TOKEN")!,
+  linkedinAccessToken: Deno.env.get("LINKEDIN_ACCESS_TOKEN")!,
+  linkedinAuthorUrn: Deno.env.get("LINKEDIN_AUTHOR_URN")!,
+  xApiKey: Deno.env.get("X_API_KEY")!,
+  xApiSecret: Deno.env.get("X_API_SECRET")!,
+  xAccessToken: Deno.env.get("X_ACCESS_TOKEN")!,
+  xAccessSecret: Deno.env.get("X_ACCESS_SECRET")!,
 };
 
 // ---------------------------------------------------------------------------
@@ -108,7 +109,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   const { data: cbData, message, id: callbackId } = callbackQuery;
-  const chatId    = message.chat.id;
+  const chatId = message.chat.id;
   const messageId = message.message_id;
 
   const supabase = createClient(env.supabaseUrl, env.supabaseKey);
@@ -198,15 +199,15 @@ async function handleApprove(
 
   const results: PublishResult[] = [
     evaluateSettled(linkedinResult, "LinkedIn"),
-    evaluateSettled(xResult,        "X (Twitter)"),
+    evaluateSettled(xResult, "X (Twitter)"),
   ];
 
   // ── Determine final status ───────────────────────────────────────────
-  const allSuccess     = results.every((r) => r.success);
-  const anySuccess     = results.some((r) => r.success);
-  const finalStatus    = allSuccess ? "PUBLISHED"
-                       : anySuccess ? "PARTIAL_FAILURE"
-                       :              "PARTIAL_FAILURE";
+  const allSuccess = results.every((r) => r.success);
+  const anySuccess = results.some((r) => r.success);
+  const finalStatus = allSuccess ? "PUBLISHED"
+    : anySuccess ? "PARTIAL_FAILURE"
+      : "PARTIAL_FAILURE";
 
   await supabase
     .from("posts")
@@ -226,11 +227,11 @@ async function handleApprove(
 
 async function publishToLinkedIn(text: string): Promise<void> {
   const payload = {
-    author:          env.linkedinAuthorUrn,
-    lifecycleState:  "PUBLISHED",
+    author: env.linkedinAuthorUrn,
+    lifecycleState: "PUBLISHED",
     specificContent: {
       "com.linkedin.ugc.ShareContent": {
-        shareCommentary:    { text },
+        shareCommentary: { text },
         shareMediaCategory: "NONE",
       },
     },
@@ -240,13 +241,13 @@ async function publishToLinkedIn(text: string): Promise<void> {
   };
 
   const resp = await fetch("https://api.linkedin.com/v2/ugcPosts", {
-    method:  "POST",
+    method: "POST",
     headers: {
-      "Authorization":              `Bearer ${env.linkedinAccessToken}`,
-      "Content-Type":               "application/json",
-      "X-Restli-Protocol-Version":  "2.0.0",
+      "Authorization": `Bearer ${env.linkedinAccessToken}`,
+      "Content-Type": "application/json",
+      "X-Restli-Protocol-Version": "2.0.0",
     },
-    body:   JSON.stringify(payload),
+    body: JSON.stringify(payload),
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
@@ -266,16 +267,16 @@ async function publishToX(text: string): Promise<void> {
    * This implementation manually signs the request using Web Crypto API
    * (available in Deno / Supabase Edge Runtime).
    */
-  const url    = "https://api.twitter.com/2/tweets";
+  const url = "https://api.twitter.com/2/tweets";
   const method = "POST";
 
   const oauthParams: Record<string, string> = {
-    oauth_consumer_key:     env.xApiKey,
-    oauth_nonce:            generateNonce(),
+    oauth_consumer_key: env.xApiKey,
+    oauth_nonce: generateNonce(),
     oauth_signature_method: "HMAC-SHA1",
-    oauth_timestamp:        String(Math.floor(Date.now() / 1000)),
-    oauth_token:            env.xAccessToken,
-    oauth_version:          "1.0",
+    oauth_timestamp: String(Math.floor(Date.now() / 1000)),
+    oauth_token: env.xAccessToken,
+    oauth_version: "1.0",
   };
 
   const signature = await buildOAuthSignature(method, url, oauthParams, {});
@@ -286,12 +287,12 @@ async function publishToX(text: string): Promise<void> {
     .join(", ");
 
   const resp = await fetch(url, {
-    method:  "POST",
+    method: "POST",
     headers: {
       "Authorization": authHeader,
-      "Content-Type":  "application/json",
+      "Content-Type": "application/json",
     },
-    body:   JSON.stringify({ text }),
+    body: JSON.stringify({ text }),
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
@@ -331,9 +332,9 @@ async function buildOAuthSignature(
 
   const signingKey = `${encodeURIComponent(env.xApiSecret)}&${encodeURIComponent(env.xAccessSecret)}`;
 
-  const keyData    = new TextEncoder().encode(signingKey);
-  const msgData    = new TextEncoder().encode(baseString);
-  const cryptoKey  = await crypto.subtle.importKey("raw", keyData, { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+  const keyData = new TextEncoder().encode(signingKey);
+  const msgData = new TextEncoder().encode(baseString);
+  const cryptoKey = await crypto.subtle.importKey("raw", keyData, { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
   const signatureBuffer = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
   return btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)));
 }
@@ -346,10 +347,10 @@ async function answerCallbackQuery(callbackQueryId: string): Promise<void> {
   await fetch(
     `https://api.telegram.org/bot${env.telegramBotToken}/answerCallbackQuery`,
     {
-      method:  "POST",
+      method: "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ callback_query_id: callbackQueryId }),
-      signal:  AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      body: JSON.stringify({ callback_query_id: callbackQueryId }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     },
   );
 }
@@ -362,12 +363,12 @@ async function editTelegramMessage(
   await fetch(
     `https://api.telegram.org/bot${env.telegramBotToken}/editMessageText`,
     {
-      method:  "POST",
+      method: "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({
-        chat_id:    chatId,
+      body: JSON.stringify({
+        chat_id: chatId,
         message_id: messageId,
-        text:       text.slice(0, 4096),
+        text: text.slice(0, 4096),
         parse_mode: "Markdown",
         reply_markup: { inline_keyboard: [] },  // remove buttons after action
       }),
@@ -385,9 +386,9 @@ function parseDraftContent(content: string): { linkedinText: string; xText: stri
    * Content stored by agent.py in format:
    *   "LINKEDIN:\n<draft>\n\nX:\n<draft>"
    */
-  const parts    = content.split("\n\nX:\n");
+  const parts = content.split("\n\nX:\n");
   const linkedin = parts[0]?.replace(/^LINKEDIN:\n/, "").trim() ?? content;
-  const x        = parts[1]?.trim() ?? content;
+  const x = parts[1]?.trim() ?? content;
   return { linkedinText: linkedin, xText: x };
 }
 
