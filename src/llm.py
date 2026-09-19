@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Optional
 
 import httpx
@@ -40,19 +41,42 @@ def _get_gemini() -> genai.Client:
 
 
 # ---------------------------------------------------------------------------
-# System Prompt Template
+# System Prompts (per-platform)
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """You are a social media ghostwriter for a senior tech professional.
-Your task is to transform a news article into an authentic, engaging social media post
-that exactly matches the provided writing style profile.
+_SYSTEM_PROMPT_LINKEDIN = """You are a ghostwriter for a senior technology professional with a strong personal brand on LinkedIn.
+Your task: transform a news article into a high-performing LinkedIn post that feels AUTHENTIC and PERSONAL, not like a news summary.
 
-Rules:
-- Write in first-person voice as the profile owner.
-- Match the tone, emoji usage, hashtag density, and structure described.
+STRUCTURE (follow this exactly, each section separated by a blank line):
+
+1. HOOK (1-2 lines): A provocative question, surprising stat, or bold statement that stops the scroll.
+2. CONTEXT (2-3 lines): Briefly explain the news in simple, non-jargon terms. What happened? Why does it matter?
+3. PERSONAL TAKE (3-5 lines): Share YOUR perspective as a tech professional. What are the implications? What does this mean for the industry, developers, or businesses? Use "I think…", "In my view…", "This tells me…"
+4. KEY INSIGHT / LESSONS (3-4 bullet points using ▸ or →): Concrete, actionable takeaways.
+5. CALL TO ACTION (1-2 lines): End with a thought-provoking question to spark discussion in the comments.
+6. HASHTAGS (3-5 relevant hashtags on the last line).
+
+STYLE RULES:
+- Write in first-person, conversational, yet professional voice.
+- Use emojis strategically (1-2 per section, not every line).
+- Short paragraphs — max 3 lines per paragraph. Use blank lines between every section.
+- Total length: 1800–2800 characters (this is critical — do NOT produce a short post).
+- NEVER use: clickbait, excessive exclamation marks, unsubstantiated claims.
 - NEVER fabricate statistics or quotes not present in the article.
-- End with a question or call-to-action to drive engagement.
-- Output ONLY the final post text – no preamble, no explanation, no quotes.
+- Output ONLY the final post text. No preamble, no markdown code fences, no "Here is the post:" prefix.
+"""
+
+_SYSTEM_PROMPT_X = """You are a ghostwriter for a senior technology professional with a strong presence on X (Twitter).
+Your task: transform a news article into a single punchy, high-engagement tweet.
+
+RULES:
+- Maximum 280 characters (hard limit — count carefully).
+- Lead with the most surprising or important point.
+- Use 1-2 relevant emojis.
+- Include 1-2 hashtags at the end.
+- Write in first-person, direct voice.
+- NEVER fabricate stats or quotes not in the article.
+- Output ONLY the tweet text. No preamble.
 """
 
 
@@ -66,7 +90,7 @@ def draft_post(
     platform: str,
 ) -> str:
     """
-    Use Gemini Flash 2.0 to draft a platform-tailored post.
+    Use Gemini to draft a platform-tailored post.
 
     Parameters
     ----------
@@ -80,51 +104,100 @@ def draft_post(
     """
     client = _get_gemini()
 
-    # ── Platform-specific constraints ───────────────────────────────────
+    # ── Platform-specific config ─────────────────────────────────────────
     if platform == "linkedin":
+        system_prompt = _SYSTEM_PROMPT_LINKEDIN
+        max_tokens    = 2048   # enough for a full ~2500 char LinkedIn post
+        temperature   = 0.80
         platform_rules = style_profile.get("linkedin", {})
-        char_limit = "up to 1300 characters"
-        format_hint = "Use line breaks for readability. Suitable for a professional audience."
+        output_spec = """Write a FULL structured LinkedIn post following the HOOK → CONTEXT → PERSONAL TAKE → KEY INSIGHTS → CTA → HASHTAGS format.
+
+The post MUST be between 1800 and 2800 characters long.
+Do NOT truncate. Do NOT summarize. Write the complete post."""
+
     else:  # 'x' / Twitter
+        system_prompt = _SYSTEM_PROMPT_X
+        max_tokens    = 500    # ample tokens for 280-char tweet without truncation
+        temperature   = 0.75
         platform_rules = style_profile.get("x", {})
-        char_limit = "under 280 characters"
-        format_hint = "Be punchy and concise. A single impactful tweet."
+        output_spec = "Write a single tweet. Maximum 280 characters. One punchy sentence + 1-2 hashtags."
 
-    user_prompt = f"""
-## Article Details
-- Title:     {article.get('title', 'N/A')}
-- Source:    {article.get('source', 'N/A')}
-- Published: {article.get('published', 'N/A')}
-- URL:       {article.get('url', 'N/A')}
+    # ── Tone/voice from style profile ────────────────────────────────────
+    tone   = style_profile.get("tone", "professional yet conversational")
+    voice  = style_profile.get("voice", "first-person, thought-leader")
+    topics = ", ".join(style_profile.get("topics_of_interest", ["AI", "technology"]))
+    avoid  = ", ".join(style_profile.get("avoid", []))
 
-## Article Body
-{article.get('body', '')[:3000]}
+    user_prompt = f"""## ARTICLE TO TRANSFORM
+Title:     {article.get('title', 'N/A')}
+Source:    {article.get('source', 'N/A')}
+Published: {article.get('published', 'N/A')}
+URL:       {article.get('url', 'N/A')}
 
-## Writing Style Profile
-{json.dumps(style_profile, indent=2)}
+## ARTICLE BODY
+{article.get('body', '')[:4000]}
 
-## Platform-Specific Rules
-Platform: {platform.upper()}
-Character limit: {char_limit}
-Format: {format_hint}
-Additional rules: {json.dumps(platform_rules, indent=2)}
+## AUTHOR'S WRITING STYLE
+- Tone:   {tone}
+- Voice:  {voice}
+- Topics this person cares about: {topics}
+- Things to AVOID: {avoid}
+- Platform rules: {json.dumps(platform_rules, indent=2)}
 
-Write the {platform.upper()} post now:
-""".strip()
+## YOUR TASK
+{output_spec}
 
-    response = client.models.generate_content(
-        model=settings.LLM_MODEL,
-        contents=user_prompt,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=_SYSTEM_PROMPT,
-            temperature=0.85,
-            max_output_tokens=800,
-        ),
-    )
+Write the {platform.upper()} post now:""".strip()
 
-    draft = response.text.strip()
-    log.info("[LLM] Drafted %s post (%d chars)", platform, len(draft))
-    return draft
+    # Build model sequence: primary model followed by fallback models
+    models_to_try = [settings.LLM_MODEL] + settings.fallback_models
+
+    last_error: Exception | None = None
+    for attempt_idx, model_name in enumerate(models_to_try):
+        try:
+            if attempt_idx > 0:
+                log.warning(
+                    "[LLM] Retrying %s draft using fallback model '%s'...",
+                    platform,
+                    model_name,
+                )
+            chat = client.chats.create(
+                model=model_name,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                ),
+            )
+            response = chat.send_message(user_prompt)
+            draft = response.text.strip() if response.text else ""
+            if draft:
+                if attempt_idx > 0:
+                    log.warning(
+                        "[LLM] Successfully drafted %s post using fallback model '%s' (%d chars)",
+                        platform,
+                        model_name,
+                        len(draft),
+                    )
+                else:
+                    log.info("[LLM] Drafted %s post using '%s' (%d chars)", platform, model_name, len(draft))
+                return draft
+        except Exception as exc:
+            last_error = exc
+            next_model = models_to_try[attempt_idx + 1] if attempt_idx + 1 < len(models_to_try) else None
+            log.warning(
+                "[LLM] Model '%s' failed for %s draft: %s. %s",
+                model_name,
+                platform,
+                exc,
+                f"Trying fallback model '{next_model}'..." if next_model else "No further fallback models.",
+            )
+            if next_model:
+                time.sleep(1)
+
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"Failed to generate draft for {platform}: model returned empty response.")
 
 
 # ---------------------------------------------------------------------------

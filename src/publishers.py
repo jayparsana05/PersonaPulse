@@ -219,6 +219,9 @@ def publish_to_x(text: str) -> None:
     Uses OAuth 1.0a User Context (required for write operations on free tier).
     Raises RuntimeError on failure.
     """
+    if not (settings.X_API_KEY and settings.X_API_SECRET and settings.X_ACCESS_TOKEN and settings.X_ACCESS_SECRET):
+        raise RuntimeError("[Publisher] X (Twitter) credentials missing in .env. Please configure them before publishing.")
+
     client = tweepy.Client(
         consumer_key=settings.X_API_KEY,
         consumer_secret=settings.X_API_SECRET,

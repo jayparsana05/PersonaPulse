@@ -69,17 +69,34 @@ class Settings:
     LINKEDIN_TOKEN_EXPIRY_DATE: str          # raw string, e.g. "2025-12-31"
 
     # ── X (Twitter) ───────────────────────────────────────────────────────
-    X_API_KEY: str
-    X_API_SECRET: str
-    X_ACCESS_TOKEN: str
-    X_ACCESS_SECRET: str
+    X_API_KEY: str = ""
+    X_API_SECRET: str = ""
+    X_ACCESS_TOKEN: str = ""
+    X_ACCESS_SECRET: str = ""
 
     # ── Derived / Optional ────────────────────────────────────────────────
     EMBEDDING_MODEL: str = "models/gemini-embedding-001"
     EMBEDDING_DIMENSIONS: int = 768
-    LLM_MODEL: str = "gemini-2.0-flash"
+    LLM_MODEL: str = "gemini-3.6-flash"
+    LLM_FALLBACK_MODEL: str = "gemini-3.5-flash-lite"
     DUPLICATE_THRESHOLD: float = 0.85
     TOKEN_WARN_DAYS: int = 5                 # alert if LinkedIn token expires within N days
+
+    @property
+    def fallback_models(self) -> list[str]:
+        """Ordered list of fallback models to try if the primary model fails or is overloaded."""
+        candidates = [
+            self.LLM_FALLBACK_MODEL,
+            "gemini-3.5-flash-lite",
+            "gemini-3.6-flash",
+        ]
+        seen = {self.LLM_MODEL}
+        fallbacks: list[str] = []
+        for model in candidates:
+            if model and model not in seen:
+                seen.add(model)
+                fallbacks.append(model)
+        return fallbacks
 
     @property
     def linkedin_token_expiry(self) -> date:
@@ -122,11 +139,14 @@ settings = Settings(
     LINKEDIN_ACCESS_TOKEN=_require("LINKEDIN_ACCESS_TOKEN"),
     LINKEDIN_AUTHOR_URN=_require("LINKEDIN_AUTHOR_URN"),
     LINKEDIN_TOKEN_EXPIRY_DATE=_require("LINKEDIN_TOKEN_EXPIRY_DATE"),
-    # X (Twitter)
-    X_API_KEY=_require("X_API_KEY"),
-    X_API_SECRET=_require("X_API_SECRET"),
-    X_ACCESS_TOKEN=_require("X_ACCESS_TOKEN"),
-    X_ACCESS_SECRET=_require("X_ACCESS_SECRET"),
+    # X (Twitter) - optional for local testing
+    X_API_KEY=_optional("X_API_KEY"),
+    X_API_SECRET=_optional("X_API_SECRET"),
+    X_ACCESS_TOKEN=_optional("X_ACCESS_TOKEN"),
+    X_ACCESS_SECRET=_optional("X_ACCESS_SECRET"),
+    # Optional model overrides
+    LLM_MODEL=_optional("LLM_MODEL", "gemini-3.6-flash"),
+    LLM_FALLBACK_MODEL=_optional("LLM_FALLBACK_MODEL", "gemini-3.5-flash-lite"),
 )
 
 __all__ = ["settings"]
