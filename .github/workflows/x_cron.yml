@@ -1,0 +1,67 @@
+# ============================================================
+# PersonaPulse – X (Twitter) Post Workflow
+# ============================================================
+# Runs the full LangGraph pipeline targeting X/Twitter.
+# Schedule: Tue/Thu/Sat at 10:00 UTC (staggered from LinkedIn).
+# Also triggerable manually via workflow_dispatch.
+# ============================================================
+
+name: "PersonaPulse – X (Twitter) Post"
+
+on:
+  schedule:
+    # Tue, Thu, Sat at 10:00 UTC
+    - cron: "0 10 * * 2,4,6"
+  workflow_dispatch:
+    inputs:
+      search_query:
+        description: "Custom Tavily search query (optional)"
+        required: false
+        default: "trending technology startups and developer tools"
+
+jobs:
+  post-to-x:
+    name: "Run PersonaPulse Pipeline (X)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      GEMINI_API_KEY:              ${{ secrets.GEMINI_API_KEY }}
+      TAVILY_API_KEY:              ${{ secrets.TAVILY_API_KEY }}
+      SUPABASE_URL:                ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY:   ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      TELEGRAM_BOT_TOKEN:          ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:            ${{ secrets.TELEGRAM_CHAT_ID }}
+      LINKEDIN_ACCESS_TOKEN:       ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
+      LINKEDIN_AUTHOR_URN:         ${{ secrets.LINKEDIN_AUTHOR_URN }}
+      LINKEDIN_TOKEN_EXPIRY_DATE:  ${{ secrets.LINKEDIN_TOKEN_EXPIRY_DATE }}
+      X_API_KEY:                   ${{ secrets.X_API_KEY }}
+      X_API_SECRET:                ${{ secrets.X_API_SECRET }}
+      X_ACCESS_TOKEN:              ${{ secrets.X_ACCESS_TOKEN }}
+      X_ACCESS_SECRET:             ${{ secrets.X_ACCESS_SECRET }}
+
+    steps:
+      - name: "⬇️ Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "🐍 Set up Python 3.11"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: "📦 Install dependencies"
+        run: pip install -r requirements.txt
+
+      - name: "🚀 Run PersonaPulse Pipeline"
+        run: |
+          QUERY="${{ github.event.inputs.search_query || 'trending technology startups and developer tools' }}"
+          python -m src.agent "$QUERY"
+
+      - name: "📋 Upload logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "personapulse-x-logs-${{ github.run_id }}"
+          path: "*.log"
+          retention-days: 7

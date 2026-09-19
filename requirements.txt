@@ -1,0 +1,30 @@
+## Python dependencies for PersonaPulse AI Social Media Agent
+
+# ── Core Agent Framework ─────────────────────────────────────────────────────
+langgraph>=0.2.0
+langchain-core>=0.3.0
+
+# ── Google Gemini (LLM + Embeddings) ─────────────────────────────────────────
+google-genai>=0.8.0
+
+# ── Supabase Client ───────────────────────────────────────────────────────────
+supabase>=2.0.0
+
+# ── Tavily Search ────────────────────────────────────────────────────────────
+tavily-python>=0.3.0
+
+# ── HTTP Client ───────────────────────────────────────────────────────────────
+httpx>=0.27.0
+
+# ── Web Scraping (og:image extraction) ───────────────────────────────────────
+beautifulsoup4>=4.12.0
+lxml>=5.0.0                  # faster HTML parser for BeautifulSoup
+
+# ── X (Twitter) API ──────────────────────────────────────────────────────────
+tweepy>=4.14.0
+
+# ── Numerics (L2 normalization) ───────────────────────────────────────────────
+numpy>=1.26.0
+
+# ── Environment & Config ──────────────────────────────────────────────────────
+python-dotenv>=1.0.0

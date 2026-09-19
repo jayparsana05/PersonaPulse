@@ -1,0 +1,25 @@
+name: Deploy Supabase Edge Function
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'supabase/functions/**' # Only runs when you edit the function
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Deploy Function
+        run: supabase functions deploy telegram-webhook --no-verify-jwt --project-ref ${{ secrets.SUPABASE_PROJECT_ID }}
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
