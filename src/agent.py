@@ -314,6 +314,7 @@ def run_pipeline(query: str = "latest AI and technology news") -> dict:
 
 
 if __name__ == "__main__":
+    print("Starting PersonaPulse Pipeline...")
     query_arg = sys.argv[1] if len(sys.argv) > 1 else "latest AI and machine learning news"
     final_state = run_pipeline(query=query_arg)
     sys.exit(0 if not final_state.get("pipeline_halted") else 1)
