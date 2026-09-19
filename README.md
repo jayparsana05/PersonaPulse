@@ -146,10 +146,12 @@ supabase link --project-ref YOUR_PROJECT_REF
 # Deploy the webhook handler
 supabase functions deploy telegram-webhook
 
-# Set Edge Function secrets
+# Set Edge Function secrets (Layer 1 secret token & Layer 2 chat authorization)
 supabase secrets set \
   SUPABASE_SERVICE_ROLE_KEY="your_key" \
   TELEGRAM_BOT_TOKEN="your_token" \
+  TELEGRAM_CHAT_ID="your_chat_id" \
+  TELEGRAM_WEBHOOK_SECRET="optional_custom_secret" \
   LINKEDIN_ACCESS_TOKEN="your_token" \
   LINKEDIN_AUTHOR_URN="urn:li:person:XXXXX" \
   X_API_KEY="your_key" \
@@ -158,13 +160,31 @@ supabase secrets set \
   X_ACCESS_SECRET="your_secret"
 ```
 
-### Step 5 – Register Telegram Webhook
+### Step 5 – Register Telegram Webhook (Two-Layer Security)
 
+You can register the webhook with strict secret token validation using either the included Python helper or `curl`:
+
+**Option A: Using the Python setup script (Recommended)**
 ```bash
-# Point Telegram to your Edge Function URL
+# Auto-detects URL and token from .env, derives compliant secret token
+python setup_webhook.py
+
+# Check registered webhook status
+python setup_webhook.py --info
+```
+
+**Option B: Using cURL**
+```bash
+# Derive secret token (SHA-256 hex digest of bot token satisfies [a-zA-Z0-9_-]{1,256})
+SECRET_TOKEN=$(echo -n "<YOUR_BOT_TOKEN>" | shasum -a 256 | awk '{print $1}')
+
 curl -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook" \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://<PROJECT_REF>.supabase.co/functions/v1/telegram-webhook"}'
+  -d '{
+    "url": "https://<PROJECT_REF>.supabase.co/functions/v1/telegram-webhook",
+    "secret_token": "'"$SECRET_TOKEN"'",
+    "allowed_updates": ["message", "callback_query"]
+  }'
 ```
 
 ### Step 6 – Add GitHub Secrets

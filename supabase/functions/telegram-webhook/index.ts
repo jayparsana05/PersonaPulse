@@ -24,6 +24,9 @@
  *   SUPABASE_URL                – your project URL
  *   SUPABASE_SERVICE_ROLE_KEY   – service role key (bypasses RLS)
  *   TELEGRAM_BOT_TOKEN          – bot token from @BotFather
+ *   TELEGRAM_CHAT_ID            – your personal Telegram chat ID (Layer 2)
+ *   TELEGRAM_WEBHOOK_SECRET     – optional custom secret token; if omitted,
+ *                                 derived via SHA-256 from TELEGRAM_BOT_TOKEN (Layer 1)
  *   LINKEDIN_ACCESS_TOKEN       – OAuth 2.0 access token
  *   LINKEDIN_AUTHOR_URN         – urn:li:person:XXXXXXXX
  *   X_API_KEY                   – Twitter/X API key
@@ -38,20 +41,33 @@ import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-
 // Types
 // ---------------------------------------------------------------------------
 
+interface TelegramChat {
+  id: number | string;
+  type?: string;
+  title?: string;
+  username?: string;
+}
+
+interface TelegramMessage {
+  message_id: number;
+  chat: TelegramChat;
+  text?: string;
+  caption?: string;
+}
+
 interface TelegramCallbackQuery {
   id: string;
   from: { id: number; username?: string };
-  message: {
-    message_id: number;
-    chat: { id: number };
-    text?: string;
-    caption?: string;
-  };
-  data: string;
+  message?: TelegramMessage;
+  data?: string;
 }
 
 interface TelegramUpdate {
   update_id: number;
+  message?: TelegramMessage;
+  edited_message?: TelegramMessage;
+  channel_post?: TelegramMessage;
+  edited_channel_post?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
 }
 
@@ -69,7 +85,7 @@ interface PublishResult {
 }
 
 // ---------------------------------------------------------------------------
-// Constants
+// Constants & Security Helpers
 // ---------------------------------------------------------------------------
 
 const FETCH_TIMEOUT_MS = 8_000;  // AbortSignal.timeout cap per spec
@@ -78,6 +94,8 @@ const env = {
   supabaseUrl: Deno.env.get("SUPABASE_URL")!,
   supabaseKey: Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
   telegramBotToken: Deno.env.get("TELEGRAM_BOT_TOKEN")!,
+  telegramChatId: Deno.env.get("TELEGRAM_CHAT_ID"),
+  telegramWebhookSecret: Deno.env.get("TELEGRAM_WEBHOOK_SECRET"),
   linkedinAccessToken: Deno.env.get("LINKEDIN_ACCESS_TOKEN")!,
   linkedinAuthorUrn: Deno.env.get("LINKEDIN_AUTHOR_URN")!,
   xApiKey: Deno.env.get("X_API_KEY")!,
@@ -86,16 +104,95 @@ const env = {
   xAccessSecret: Deno.env.get("X_ACCESS_SECRET")!,
 };
 
+/**
+ * Derives a valid Telegram secret token [a-zA-Z0-9_-]{1,256} from the bot token.
+ * Telegram Bot API requires secret tokens to only contain [a-zA-Z0-9_-].
+ * SHA-256 hex digest produces a 64-character string of [0-9a-f], perfectly compliant.
+ */
+async function deriveSecret(token: string): Promise<string> {
+  const data = new TextEncoder().encode(token);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Returns the expected webhook secret:
+ * 1. TELEGRAM_WEBHOOK_SECRET if explicitly configured.
+ * 2. SHA-256 hex digest of TELEGRAM_BOT_TOKEN as fallback.
+ */
+async function getExpectedWebhookSecret(): Promise<string> {
+  const configured = Deno.env.get("TELEGRAM_WEBHOOK_SECRET")?.trim();
+  if (configured) {
+    return configured;
+  }
+  const botToken = Deno.env.get("TELEGRAM_BOT_TOKEN")?.trim() ?? "";
+  if (!botToken) {
+    console.error("[Security] Neither TELEGRAM_WEBHOOK_SECRET nor TELEGRAM_BOT_TOKEN is set.");
+    return "";
+  }
+  return await deriveSecret(botToken);
+}
+
+/**
+ * Performs a constant-time string comparison to mitigate timing attacks.
+ */
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) {
+    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
+/**
+ * Extracts chat.id from incoming Telegram update.
+ * Handles both standard message.chat.id and inline callback_query.message.chat.id,
+ * plus edited messages and channel posts.
+ */
+function extractChatId(update: TelegramUpdate): string | null {
+  if (update.callback_query?.message?.chat?.id !== undefined) {
+    return String(update.callback_query.message.chat.id);
+  }
+  if (update.message?.chat?.id !== undefined) {
+    return String(update.message.chat.id);
+  }
+  if (update.edited_message?.chat?.id !== undefined) {
+    return String(update.edited_message.chat.id);
+  }
+  if (update.channel_post?.chat?.id !== undefined) {
+    return String(update.channel_post.chat.id);
+  }
+  if (update.edited_channel_post?.chat?.id !== undefined) {
+    return String(update.edited_channel_post.chat.id);
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Main Handler
 // ---------------------------------------------------------------------------
 
 Deno.serve(async (req: Request): Promise<Response> => {
+  // ── Layer 1: Secret Token Header Check ────────────────────────────────────
+  // Read X-Telegram-Bot-Api-Secret-Token from incoming request before doing anything else
+  const secretHeader = req.headers.get("X-Telegram-Bot-Api-Secret-Token");
+  const expectedSecret = await getExpectedWebhookSecret();
+
+  if (!secretHeader || !expectedSecret || !timingSafeEqual(secretHeader, expectedSecret)) {
+    console.warn("[Security] Unauthorized: Invalid or missing X-Telegram-Bot-Api-Secret-Token header.");
+    return new Response("Unauthorized", { status: 401 });
+  }
+
   // Only accept POST requests from Telegram
   if (req.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405 });
   }
 
+  // Parse JSON payload
   let update: TelegramUpdate;
   try {
     update = await req.json();
@@ -103,14 +200,30 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return new Response("Bad Request: invalid JSON", { status: 400 });
   }
 
+  // ── Layer 2: Chat ID Check ────────────────────────────────────────────────
+  // Extract chat.id from payload and compare strictly against TELEGRAM_CHAT_ID
+  const expectedChatId = Deno.env.get("TELEGRAM_CHAT_ID")?.trim();
+  const incomingChatId = extractChatId(update);
+
+  if (!expectedChatId || !incomingChatId || incomingChatId !== expectedChatId) {
+    console.warn(
+      `[Security] Forbidden: Incoming chat.id '${incomingChatId}' does not match TELEGRAM_CHAT_ID '${expectedChatId}'.`
+    );
+    return new Response("Forbidden", { status: 403 });
+  }
+
   const callbackQuery = update.callback_query;
   if (!callbackQuery) {
-    // Not a callback query (could be a regular message) – acknowledge silently
+    // Not a callback query (e.g. regular text message from authorized chat) – acknowledge silently
     return new Response("OK", { status: 200 });
   }
 
   const { data: cbData, message, id: callbackId } = callbackQuery;
-  const chatId = message.chat.id;
+  if (!message || !cbData) {
+    return new Response("OK", { status: 200 });
+  }
+
+  const chatId = Number(message.chat.id);
   const messageId = message.message_id;
 
   const supabase = createClient(env.supabaseUrl, env.supabaseKey);
