@@ -7,6 +7,7 @@
  * Receives Telegram callback_query webhook events triggered when a user
  * taps the inline ✅ Approve or ❌ Reject buttons in the approval message.
  *
+ * 
  * Workflow
  * --------
  *   approve_<post_id>  →  Fetch draft from Supabase
