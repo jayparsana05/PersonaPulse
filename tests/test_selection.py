@@ -523,6 +523,24 @@ class FrameQuestionTest(unittest.TestCase):
         self.assertIn("Tool use", question.question)
         self.assertEqual(question.aspects, [])
 
+    def test_selected_topic_with_incomplete_metadata(self):
+        """A bare TopicCandidate (title only) still yields a research question."""
+        topic = TopicCandidate(title="Orchestration layers")
+        payload = {"question": "How do orchestration layers compose?", "aspects": ["control plane"]}
+        with patch("src.selection.complete_text", return_value=_dump(payload)):
+            question = frame_question(topic)
+        self.assertEqual(question.topic, "Orchestration layers")
+        self.assertEqual(question.question, payload["question"])
+        self.assertEqual(question.aspects, ["control plane"])
+
+    def test_incomplete_metadata_fallback_still_names_topic(self):
+        """With bare metadata AND an LLM failure, the default question still names the topic."""
+        with patch("src.selection.complete_text", side_effect=RuntimeError("LLM down")):
+            question = frame_question(TopicCandidate(title="Bare topic"))
+        self.assertEqual(question.status, ResearchQuestion.STATUS_PROPOSED)
+        self.assertIn("Bare topic", question.question)
+        self.assertEqual(question.aspects, [])
+
 
 class TopicSelectionSerializationTest(unittest.TestCase):
     def test_round_trip_with_selected(self):

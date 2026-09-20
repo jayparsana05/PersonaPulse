@@ -94,6 +94,16 @@ def _optional_int(key: str, default: int) -> int:
         return default
 
 
+def _optional_float(key: str, default: float) -> float:
+    """Return an env var as float, falling back to *default* on missing/garbage."""
+    raw = _optional(key, str(default))
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[Config] ⚠️  '{key}' must be a float, got '{raw}'. Using {default}.")
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Settings dataclass
 # ---------------------------------------------------------------------------
@@ -133,6 +143,19 @@ class Settings:
     DUPLICATE_THRESHOLD: float = 0.85
     TOKEN_WARN_DAYS: int = 5                 # alert if LinkedIn token expires within N days
     DISCOVERY_CANDIDATE_COUNT: int = 5       # max topic candidates per discovery run
+
+    # ── Research (Prompt 4) ────────────────────────────────────────────────
+    # Limits for the Research stage. Semantics:
+    #   RESEARCH_MAX_QUERIES         – max search queries generated per research question
+    #   RESEARCH_MAX_SOURCES_PER_QUERY – max provider results fetched per query
+    #   RESEARCH_MAX_SOURCES        – max normalized/deduplicated sources kept
+    #   RESEARCH_MIN_SCORE          – keep results whose provider relevance score
+    #                                 (0.0–1.0) is >= this threshold; 0.0 disables
+    #                                 the filter. Results without a score are kept.
+    RESEARCH_MAX_QUERIES: int = 4
+    RESEARCH_MAX_SOURCES_PER_QUERY: int = 5
+    RESEARCH_MAX_SOURCES: int = 10
+    RESEARCH_MIN_SCORE: float = 0.1
 
     @property
     def fallback_models(self) -> list[str]:
@@ -201,6 +224,11 @@ settings = Settings(
     LLM_FALLBACK_MODEL=_optional("LLM_FALLBACK_MODEL", "gemini-3.5-flash-lite"),
     # Discovery tuning
     DISCOVERY_CANDIDATE_COUNT=_optional_int("DISCOVERY_CANDIDATE_COUNT", 5),
+    # Research tuning (Prompt 4)
+    RESEARCH_MAX_QUERIES=_optional_int("RESEARCH_MAX_QUERIES", 4),
+    RESEARCH_MAX_SOURCES_PER_QUERY=_optional_int("RESEARCH_MAX_SOURCES_PER_QUERY", 5),
+    RESEARCH_MAX_SOURCES=_optional_int("RESEARCH_MAX_SOURCES", 10),
+    RESEARCH_MIN_SCORE=_optional_float("RESEARCH_MIN_SCORE", 0.1),
 )
 
 __all__ = ["settings", "EXCLUDED_SEARCH_DOMAINS", "AGENTIC_SEARCH_QUERIES", "TOPIC_SELECTION_CRITERIA"]

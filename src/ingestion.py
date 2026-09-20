@@ -8,6 +8,7 @@ Key Functions
 -------------
 - fetch_trending_tech_news(query)         → dict                 (legacy single-article)
 - discover_topic_candidates(query, limit) → list[TopicCandidate] (Phase-1 discovery)
+- search_news(query, ...)                 → list[dict]           (shared Tavily news search)
 - extract_og_image(article_url)           → bytes | None
 - extract_og_image_with_url(article_url)  → (image_url, bytes) | (None, None)
 """
@@ -56,16 +57,21 @@ def _get_tavily() -> TavilyClient:
 
 
 # ---------------------------------------------------------------------------
-# Tavily search helper (shared by single-article and discovery flows)
+# Tavily search helper (shared by single-article, discovery, and research)
 # ---------------------------------------------------------------------------
 
-def _search_tavily(
+def search_news(
     query: str,
     days: int = 7,
     max_results: int = 1,
     include_raw_content: bool = True,
 ) -> list[dict]:
-    """Run a Tavily search and return the raw results list (may be empty)."""
+    """Run a Tavily news search and return the raw results list (may be empty).
+
+    Shared by the legacy single-article flow, Phase-1 discovery, and the
+    Prompt-4 research stage so they all use the same Tavily client, recency
+    window, and domain exclusions.
+    """
     client = _get_tavily()
     response = client.search(
         query=query,
@@ -77,6 +83,21 @@ def _search_tavily(
         exclude_domains=EXCLUDED_SEARCH_DOMAINS,
     )
     return response.get("results", [])
+
+
+def _search_tavily(
+    query: str,
+    days: int = 7,
+    max_results: int = 1,
+    include_raw_content: bool = True,
+) -> list[dict]:
+    """Backward-compatible alias used by legacy callers of the search helper."""
+    return search_news(
+        query=query,
+        days=days,
+        max_results=max_results,
+        include_raw_content=include_raw_content,
+    )
 
 
 def _resolve_query(query: Optional[str]) -> str:

@@ -10,12 +10,16 @@ Key Functions
 - get_normalized_embedding(text)  → list[float]
 - check_is_duplicate(embedding, threshold)  → bool
 - store_draft(platform, topic, content, embedding, article_url, image_url) → str  (UUID)
+- store_research_question(question)  → str  (UUID)
+- store_research_sources(question_id, sources)  → list[str]  (UUIDs)
 - update_post_status(post_id, status)
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -24,6 +28,7 @@ from google.genai import types as genai_types
 from supabase import create_client, Client
 
 from src.config import settings
+from src.models import ResearchQuestion, ResearchSource
 
 log = logging.getLogger(__name__)
 
@@ -169,6 +174,72 @@ def store_draft(
     post_id: str = result.data[0]["id"]
     log.info("[Memory] Draft stored – id=%s  platform=%s", post_id, platform)
     return post_id
+
+
+# ---------------------------------------------------------------------------
+# Public: Store Research Question
+# ---------------------------------------------------------------------------
+
+def store_research_question(question: ResearchQuestion) -> str:
+    """
+    Insert the framing research question into the `research_questions`
+    table, keeping topic + question + created_at together for traceability.
+    Returns the generated UUID of the new row.
+    """
+    supabase = _get_supabase()
+
+    row = {
+        "topic": question.topic,
+        "question": question.question,
+        "aspects": json.dumps(list(question.aspects), ensure_ascii=False),
+        "status": question.status,
+        "priority": question.priority,
+    }
+
+    result = supabase.table("research_questions").insert(row).execute()
+    question_id: str = result.data[0]["id"]
+    log.info("[Memory] Research question stored – id=%s  topic=%s", question_id, question.topic)
+    return question_id
+
+
+# ---------------------------------------------------------------------------
+# Public: Store Research Sources
+# ---------------------------------------------------------------------------
+
+def store_research_sources(
+    research_question_id: Optional[str],
+    sources: list[ResearchSource],
+) -> list[str]:
+    """
+    Insert the normalized, deduplicated research sources into the
+    ``research_sources`` table, each row linked to the originating research
+    question (when its id is known). Returns the generated UUIDs.
+
+    Persistence here is intentionally per-source so a partial failure never
+    silently drops rows; callers wrap the whole call in try/except to keep
+    the in-memory research result intact.
+    """
+    supabase = _get_supabase()
+    source_ids: list[str] = []
+
+    for source in sources:
+        accessed_at = source.accessed_at or datetime.now(timezone.utc)
+        row = {
+            "research_question_id": research_question_id,
+            "url": source.url,
+            "title": source.title,
+            "body": source.body,
+            "source": source.source,
+            "published": source.published,
+            "score": source.score,
+            "source_type": source.source_type,
+            "accessed_at": accessed_at.isoformat(),
+        }
+        result = supabase.table("research_sources").insert(row).execute()
+        source_ids.append(result.data[0]["id"])
+
+    log.info("[Memory] Stored %d research source(s) for question_id=%s", len(source_ids), research_question_id)
+    return source_ids
 
 
 # ---------------------------------------------------------------------------

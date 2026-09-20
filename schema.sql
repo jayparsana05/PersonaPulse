@@ -36,6 +36,26 @@ CREATE INDEX IF NOT EXISTS posts_status_idx ON posts (status);
 CREATE INDEX IF NOT EXISTS posts_created_at_idx ON posts (created_at DESC);
 
 -- ============================================================
+-- TABLE 1b: research_questions (Episodic Memory – Research Agent)
+-- Stores the framing research question derived from a selected
+-- topic. topic + question + created_at provide full traceability:
+-- every question is linked back to the topic it was framed for
+-- and the moment it was generated.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS research_questions (
+    id          UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+    topic       TEXT          NOT NULL,                     -- selected topic title
+    question    TEXT          NOT NULL,                     -- primary research question
+    aspects     JSONB         DEFAULT '[]',                 -- supporting sub-questions
+    status      VARCHAR(32)   DEFAULT 'proposed',           -- proposed | researching | answered | dropped
+    priority    VARCHAR(16)   DEFAULT 'normal',             -- high | normal | low
+    created_at  TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS research_questions_created_at_idx
+    ON research_questions (created_at DESC);
+
+-- ============================================================
 -- TABLE 2: style_profile (Semantic Memory)
 -- Stores a single JSONB document representing the master
 -- writing style profile derived from historical posts.

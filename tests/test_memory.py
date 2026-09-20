@@ -34,7 +34,8 @@ _REQUIRED_ENV = {
 for _key, _value in _REQUIRED_ENV.items():
     os.environ.setdefault(_key, _value)
 
-from src.memory import store_draft  # noqa: E402
+from src.memory import store_draft, store_research_question, store_research_sources  # noqa: E402
+from src.models import ResearchQuestion, ResearchSource  # noqa: E402
 
 
 class FakeResult:
@@ -47,6 +48,7 @@ class FakeSupabase:
     def __init__(self):
         self.table_name = None
         self.row = None
+        self.rows = []
 
     def table(self, name):
         self.table_name = name
@@ -54,6 +56,7 @@ class FakeSupabase:
 
     def insert(self, row):
         self.row = row
+        self.rows.append(row)
         return self
 
     def execute(self):
@@ -107,6 +110,117 @@ class StoreDraftTest(unittest.TestCase):
     def test_status_is_pending(self):
         self._store()
         self.assertEqual(self.fake_client.row["status"], "PENDING")
+
+
+class StoreResearchQuestionTest(unittest.TestCase):
+    """store_research_question inserts a traceable row with topic + question."""
+
+    def setUp(self):
+        self.fake_client = FakeSupabase()
+
+    def _question(self, **kwargs):
+        defaults = {
+            "topic": "Agentic orchestration",
+            "question": "Which orchestration framework scales best?",
+            "aspects": ["reliability", "cost"],
+            "status": ResearchQuestion.STATUS_PROPOSED,
+            "priority": ResearchQuestion.PRIORITY_NORMAL,
+        }
+        defaults.update(kwargs)
+        return ResearchQuestion(**defaults)
+
+    def _store(self, **kwargs):
+        with patch("src.memory._get_supabase", return_value=self.fake_client):
+            return store_research_question(self._question(**kwargs))
+
+    def test_returns_question_id(self):
+        self.assertEqual(self._store(), FakeResult.data[0]["id"])
+
+    def test_inserts_into_research_questions_table(self):
+        self._store()
+        self.assertEqual(self.fake_client.table_name, "research_questions")
+
+    def test_row_records_topic_and_question(self):
+        self._store()
+        self.assertEqual(self.fake_client.row["topic"], "Agentic orchestration")
+        self.assertEqual(
+            self.fake_client.row["question"], "Which orchestration framework scales best?"
+        )
+
+    def test_aspects_are_serialized_as_json(self):
+        self._store()
+        self.assertEqual(
+            self.fake_client.row["aspects"], '["reliability", "cost"]'
+        )
+
+    def test_status_and_priority_are_recorded(self):
+        self._store(status="proposed", priority="normal")
+        self.assertEqual(self.fake_client.row["status"], "proposed")
+        self.assertEqual(self.fake_client.row["priority"], "normal")
+
+    def test_current_status_and_priority_round_trip(self):
+        self._store(status="researching", priority="high")
+        self.assertEqual(self.fake_client.row["status"], "researching")
+        self.assertEqual(self.fake_client.row["priority"], "high")
+
+
+class StoreResearchSourcesTest(unittest.TestCase):
+    """store_research_sources inserts each normalized source into research_sources."""
+
+    def setUp(self):
+        self.fake_client = FakeSupabase()
+
+    def _sources(self, n=2):
+        return [
+            ResearchSource(
+                url=f"https://ex.com/{i}",
+                title=f"Source {i}",
+                body="A body snippet.",
+                published="2026-09-19",
+                source="ex.com",
+                score=0.9 - i / 10,
+                source_type=ResearchSource.SOURCE_TYPE_SECONDARY,
+            )
+            for i in range(n)
+        ]
+
+    def _store(self, sources=None, question_id="qid-1"):
+        with patch("src.memory._get_supabase", return_value=self.fake_client):
+            return store_research_sources(question_id, sources if sources is not None else self._sources())
+
+    def test_inserts_into_research_sources_table(self):
+        self._store()
+        self.assertEqual(self.fake_client.table_name, "research_sources")
+
+    def test_persists_each_normalized_source(self):
+        self._store(self._sources(3))
+        self.assertEqual(len(self.fake_client.rows), 3)
+
+    def test_row_contains_source_metadata(self):
+        self._store(self._sources(1))
+        row = self.fake_client.rows[0]
+        self.assertEqual(row["url"], "https://ex.com/0")
+        self.assertEqual(row["title"], "Source 0")
+        self.assertEqual(row["body"], "A body snippet.")
+        self.assertEqual(row["source"], "ex.com")
+        self.assertEqual(row["published"], "2026-09-19")
+        self.assertEqual(row["score"], 0.9)
+        self.assertEqual(row["source_type"], ResearchSource.SOURCE_TYPE_SECONDARY)
+        self.assertIsNotNone(row["accessed_at"])
+
+    def test_links_each_row_to_the_question_id(self):
+        self._store(self._sources(2), question_id="qid-7")
+        for row in self.fake_client.rows:
+            self.assertEqual(row["research_question_id"], "qid-7")
+
+    def test_question_id_none_when_unknown(self):
+        self._store(question_id=None)
+        self.assertIsNone(self.fake_client.rows[0]["research_question_id"])
+
+    def test_returns_one_id_per_source(self):
+        ids = self._store(self._sources(2))
+        self.assertEqual(len(ids), 2)
+        self.assertTrue(all(i == FakeResult.data[0]["id"] for i in ids))
 
 
 if __name__ == "__main__":

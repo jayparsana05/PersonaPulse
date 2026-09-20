@@ -20,6 +20,7 @@ Entry Points
     python -m src.agent "quantum computing news" # custom query
     python -m src.agent --discover               # Phase-1 discovery only
     python -m src.agent --select                 # discover → select → frame question
+    python -m src.agent --research "question"    # Prompt-4 research on a bare question
 """
 
 from __future__ import annotations
@@ -42,7 +43,11 @@ from src.memory import (
     get_normalized_embedding,
     get_style_profile,
     store_draft,
+    store_research_question,
+    store_research_sources,
 )
+from src.models import ResearchQuestion
+from src.research import research_question as research_stage
 from src.selection import frame_question, select_topic
 
 log = logging.getLogger(__name__)
@@ -72,6 +77,7 @@ class AgentState(TypedDict, total=False):
     # Selection (research-agent phase)
     selection: dict                     # TopicSelection dict (selected + reasoning)
     research_question: dict             # ResearchQuestion dict for the selected topic
+    research_question_id: str           # persisted research_questions row id
 
     # Deduplication
     embedding: list[float]
@@ -422,9 +428,11 @@ def run_selection(
     Returns
     -------
     dict with keys:
-        topic_candidates : list[TopicCandidate] (discovered, may be empty)
-        selection        : TopicSelection (selected + reasoning + criteria)
-        research_question: ResearchQuestion or None (when nothing was selected)
+        topic_candidates   : list[TopicCandidate] (discovered, may be empty)
+        selection          : TopicSelection (selected + reasoning + criteria)
+        research_question  : ResearchQuestion or None (when nothing was selected)
+        research_question_id : UUID of the persisted research_questions row,
+                              or None when nothing was selected (or persistence failed)
     """
     logging.basicConfig(
         level  = logging.INFO,
@@ -454,15 +462,110 @@ def run_selection(
 
     question = frame_question(selection.selected, query=query)
 
+    question_id = None
     if question is not None:
         log.info("  ❓ Research question: %s", question.question)
         if question.aspects:
             log.info("  Aspects: %s", ", ".join(question.aspects))
+        try:
+            question_id = store_research_question(question)
+            log.info("  💾 Research question stored – id=%s", question_id)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.warning(
+                "⚠️  Could not persist research question (%s: %s) – continuing.",
+                type(exc).__name__, exc,
+            )
 
     return {
         "topic_candidates": list(candidates),
         "selection": selection,
         "research_question": question,
+        "research_question_id": question_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Prompt-4 Research Entry Point (Research Agent)
+# ---------------------------------------------------------------------------
+# ResearchQuestion → research queries → multi-source search → normalize →
+# dedupe → ResearchSource[]. Stop. Independent of the production LangGraph
+# pipeline: evidence extraction, synthesis, and reporting are later phases.
+
+def run_research(
+    rq,
+    research_question_id: Optional[str] = None,
+    use_llm: bool = True,
+    max_queries: Optional[int] = None,
+    max_sources_per_query: Optional[int] = None,
+    max_sources: Optional[int] = None,
+    min_score: Optional[float] = None,
+) -> dict:
+    """
+    Run the Prompt-4 research stage for an existing ResearchQuestion.
+
+    Parameters
+    ----------
+    rq : ResearchQuestion
+        The framed question to research (from frame_question / run_selection).
+    research_question_id : str, optional
+        UUID of the persisted research_questions row, used to link the
+        collected sources back to their question. Sources are NOT persisted
+        when this is None/empty (the in-memory results are still returned);
+        a falsy flag such as None keeps the stage non-blocking but avoids
+        creating unlinked research_sources rows.
+    use_llm / max_queries / max_sources_per_query / max_sources / min_score :
+        passed through to the research stage (see src.research.research_question).
+
+    Returns
+    -------
+    dict with keys:
+        research_question    : the ResearchQuestion researched
+        research_sources     : list[ResearchSource] (normalized + deduplicated)
+        status               : "ok" when ≥1 source, else "empty"
+        research_source_ids  : list[str] of persisted row UUIDs (may be empty
+                               when nothing was persisted or persistence failed)
+    """
+    logging.basicConfig(
+        level  = logging.INFO,
+        format = "%(asctime)s %(levelname)-8s │ %(message)s",
+        datefmt= "%H:%M:%S",
+    )
+
+    log.info("🔎 Research Agent – Research | question='%s'", getattr(rq, "question", rq))
+
+    sources = research_stage(
+        rq,
+        use_llm=use_llm,
+        max_queries=max_queries,
+        max_sources_per_query=max_sources_per_query,
+        max_sources=max_sources,
+        min_score=min_score,
+    )
+
+    source_ids: list[str] = []
+    if sources:
+        if research_question_id:
+            try:
+                source_ids = store_research_sources(research_question_id, sources)
+            except Exception as exc:  # pylint: disable=broad-except
+                log.warning(
+                    "⚠️  Could not persist research sources (%s: %s) – continuing with in-memory result.",
+                    type(exc).__name__, exc,
+                )
+        else:
+            log.warning(
+                "🧭 No research_question_id – skipping source persistence (%d source(s) kept in memory).",
+                len(sources),
+            )
+    else:
+        log.warning("🧭 Research returned no usable sources for the question.")
+
+    log.info("  📚 Research complete: %d source(s) | status=%s", len(sources), "ok" if sources else "empty")
+    return {
+        "research_question": rq,
+        "research_sources": sources,
+        "status": "ok" if sources else "empty",
+        "research_source_ids": source_ids,
     }
 
 
@@ -476,6 +579,15 @@ if __name__ == "__main__":
 
     if args and args[0] == "--select":
         result = run_selection(query=args[1] if len(args) > 1 else "")
+        sys.exit(0)
+
+    if args and args[0] == "--research":
+        rq = ResearchQuestion(
+            topic=args[1] if len(args) > 1 else "",
+            question=args[1] if len(args) > 1 else "",
+            aspects=[],
+        )
+        result = run_research(rq)
         sys.exit(0)
 
     query_arg = args[0] if args else ""

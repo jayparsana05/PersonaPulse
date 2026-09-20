@@ -76,7 +76,8 @@ class RunSelectionTest(unittest.TestCase):
         question = question_for(topics[0])
         with patch("src.agent.discover_topic_candidates") as discover, \
              patch("src.agent.select_topic", return_value=selection) as select, \
-             patch("src.agent.frame_question", return_value=question) as frame:
+             patch("src.agent.frame_question", return_value=question) as frame, \
+             patch("src.agent.store_research_question", return_value="qid-1") as store:
             result = run_selection(query="agentic AI", limit=5, candidates=topics)
 
         discover.assert_not_called()
@@ -85,40 +86,65 @@ class RunSelectionTest(unittest.TestCase):
         self.assertEqual(result["topic_candidates"], topics)
         self.assertEqual(result["selection"], selection)
         self.assertEqual(result["research_question"], question)
+        self.assertEqual(result["research_question_id"], "qid-1")
+        store.assert_called_once_with(question)
 
     def test_discovers_candidates_when_none_provided(self):
         topics = [candidate()]
         selection = selection_for(topics[0])
         with patch("src.agent.discover_topic_candidates", return_value=topics) as discover, \
              patch("src.agent.select_topic", return_value=selection), \
-             patch("src.agent.frame_question", return_value=question_for(topics[0])):
+             patch("src.agent.frame_question", return_value=question_for(topics[0])), \
+             patch("src.agent.store_research_question", return_value="qid-2") as store:
             result = run_selection(query="agentic AI", limit=5)
 
         discover.assert_called_once_with(query="agentic AI", limit=5)
         self.assertEqual(result["topic_candidates"], topics)
+        self.assertEqual(result["research_question_id"], "qid-2")
+        store.assert_called_once()
 
     def test_not_selected_returns_none_question(self):
-        """When selection picks nothing, no research question is framed."""
+        """When selection picks nothing, no research question is framed or stored."""
         empty_selection = TopicSelection(
             reasoning="Nothing fit.",
             mode=TopicSelection.MODE_NONE_FIT,
         )
         with patch("src.agent.discover_topic_candidates", return_value=[]), \
              patch("src.agent.select_topic", return_value=empty_selection), \
-             patch("src.agent.frame_question", return_value=None) as frame:
+             patch("src.agent.frame_question", return_value=None) as frame, \
+             patch("src.agent.store_research_question") as store:
             result = run_selection(query="agentic AI", limit=5)
 
         self.assertIsNone(result["selection"].selected)
         self.assertIsNone(result["research_question"])
+        self.assertIsNone(result["research_question_id"])
         frame.assert_called_once_with(None, query="agentic AI")
+        store.assert_not_called()
 
     def test_empty_query_rotates_via_discovery(self):
         with patch("src.agent.discover_topic_candidates", return_value=[]) as discover, \
              patch("src.agent.select_topic", return_value=TopicSelection(mode=TopicSelection.MODE_EMPTY)), \
-             patch("src.agent.frame_question", return_value=None):
+             patch("src.agent.frame_question", return_value=None), \
+             patch("src.agent.store_research_question"):
             run_selection()
 
         discover.assert_called_once_with(query=None, limit=None)
+
+    def test_persistence_failure_does_not_block_selection(self):
+        """A Supabase failure while storing must not break the selection result."""
+        topics = [candidate()]
+        selection = selection_for(topics[0])
+        question = question_for(topics[0])
+        with patch("src.agent.discover_topic_candidates", return_value=topics), \
+             patch("src.agent.select_topic", return_value=selection), \
+             patch("src.agent.frame_question", return_value=question), \
+             patch("src.agent.store_research_question", side_effect=RuntimeError("db down")) as store:
+            result = run_selection(query="agentic AI", limit=5, candidates=topics)
+
+        self.assertEqual(result["selection"], selection)
+        self.assertEqual(result["research_question"], question)
+        self.assertIsNone(result["research_question_id"])
+        store.assert_called_once()
 
 
 if __name__ == "__main__":
