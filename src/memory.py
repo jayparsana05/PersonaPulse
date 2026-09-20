@@ -9,7 +9,7 @@ Key Functions
 -------------
 - get_normalized_embedding(text)  → list[float]
 - check_is_duplicate(embedding, threshold)  → bool
-- store_draft(platform, topic, content, embedding, image_url) → str  (UUID)
+- store_draft(platform, topic, content, embedding, article_url, image_url) → str  (UUID)
 - update_post_status(post_id, status)
 """
 
@@ -144,6 +144,7 @@ def store_draft(
     topic: str,
     content: str,
     embedding: list[float],
+    article_url: Optional[str] = None,
     image_url: Optional[str] = None,
 ) -> str:
     """
@@ -158,6 +159,7 @@ def store_draft(
         "platform": platform,
         "topic": topic,
         "content": content,
+        "article_url": article_url,
         "image_url": image_url,
         "embedding": vector_literal,
         "status": "PENDING",

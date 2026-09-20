@@ -20,6 +20,29 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
+# Domain exclusion list for Tavily search (add more domains here later)
+# ---------------------------------------------------------------------------
+EXCLUDED_SEARCH_DOMAINS: list[str] = [
+    "facebook.com",
+    "m.facebook.com",
+    "web.facebook.com",
+    "fb.com",
+]
+
+# ---------------------------------------------------------------------------
+# Agentic-AI search queries – rotated per pipeline run for content discovery.
+# Add/remove terms here to steer trending topics without touching the search code.
+# ---------------------------------------------------------------------------
+AGENTIC_SEARCH_QUERIES: list[str] = [
+    "agentic AI",
+    "AI agents",
+    "multi-agent systems",
+    "LLM agents production",
+    "agent orchestration frameworks",
+    "autonomous AI agents",
+]
+
+# ---------------------------------------------------------------------------
 # Load .env file from the project root (two levels up from src/)
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +64,16 @@ def _require(key: str) -> str:
 
 def _optional(key: str, default: str = "") -> str:
     return os.getenv(key, default).strip()
+
+
+def _optional_int(key: str, default: int) -> int:
+    """Return an env var as int, falling back to *default* on missing/garbage."""
+    raw = _optional(key, str(default))
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[Config] ⚠️  '{key}' must be an integer, got '{raw}'. Using {default}.")
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +114,7 @@ class Settings:
     LLM_FALLBACK_MODEL: str = "gemini-3.5-flash-lite"
     DUPLICATE_THRESHOLD: float = 0.85
     TOKEN_WARN_DAYS: int = 5                 # alert if LinkedIn token expires within N days
+    DISCOVERY_CANDIDATE_COUNT: int = 5       # max topic candidates per discovery run
 
     @property
     def fallback_models(self) -> list[str]:
@@ -147,6 +181,8 @@ settings = Settings(
     # Optional model overrides
     LLM_MODEL=_optional("LLM_MODEL", "gemini-3.6-flash"),
     LLM_FALLBACK_MODEL=_optional("LLM_FALLBACK_MODEL", "gemini-3.5-flash-lite"),
+    # Discovery tuning
+    DISCOVERY_CANDIDATE_COUNT=_optional_int("DISCOVERY_CANDIDATE_COUNT", 5),
 )
 
-__all__ = ["settings"]
+__all__ = ["settings", "EXCLUDED_SEARCH_DOMAINS", "AGENTIC_SEARCH_QUERIES"]

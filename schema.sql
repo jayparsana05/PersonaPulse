@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS posts (
     platform    VARCHAR(32)   NOT NULL,                                -- 'linkedin', 'x', or 'both'
     topic       VARCHAR(256)  NOT NULL,
     content     TEXT          NOT NULL,
+    article_url TEXT,
     image_url   TEXT,
     embedding   VECTOR(768),                                           -- gemini-embedding-001 @ 768-dim, L2-normalized
     status      VARCHAR(32)   DEFAULT 'PENDING',                       -- PENDING | PUBLISHED | REJECTED | PARTIAL_FAILURE

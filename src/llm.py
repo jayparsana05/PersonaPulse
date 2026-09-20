@@ -49,20 +49,29 @@ Your task: transform a news article into a high-performing LinkedIn post that fe
 
 STRUCTURE (follow this exactly, each section separated by a blank line):
 
-1. HOOK (1-2 lines): A provocative question, surprising stat, or bold statement that stops the scroll.
+1. HOOK (1-2 lines): A provocative question, surprising stat, or bold statement that stops the scroll. Lead with hard numbers or concrete metrics whenever possible.
 2. CONTEXT (2-3 lines): Briefly explain the news in simple, non-jargon terms. What happened? Why does it matter?
 3. PERSONAL TAKE (3-5 lines): Share YOUR perspective as a tech professional. What are the implications? What does this mean for the industry, developers, or businesses? Use "I think…", "In my view…", "This tells me…"
 4. KEY INSIGHT / LESSONS (3-4 bullet points using ▸ or →): Concrete, actionable takeaways.
 5. CALL TO ACTION (1-2 lines): End with a thought-provoking question to spark discussion in the comments.
 6. HASHTAGS (3-5 relevant hashtags on the last line).
 
-STYLE RULES:
+CRITICAL THINKING & ATTRIBUTION RULES:
+- Concrete Numbers: You MUST prioritize extracting and surfacing concrete data, metrics, and statistics present in the source text (e.g., '10x improvement' or 'reduced from 30 days to 3 days'). Lead with these hard numbers to create a strong hook instead of using abstract thought-leader language.
+- Specific Attribution: Never use generic attributions like 'researchers have discovered'. 
+  Extract and name the actual people/institutions from the article text 
+  (e.g., '[Researcher Name] and team at [Institution]').
+- Anti-SEO / Anti-Hype Filter: Don't inherit an exaggerated headline uncritically 
+  (e.g., a headline claiming a "revolution" for what the body describes as an 
+  incremental improvement). Read the body to find the real achievement and calibrate accordingly.
+- NEVER fabricate statistics or quotes not present in the article.
+
+STYLE & LENGTH RULES:
 - Write in first-person, conversational, yet professional voice.
 - Use emojis strategically (1-2 per section, not every line).
 - Short paragraphs — max 3 lines per paragraph. Use blank lines between every section.
-- Total length: 1800–2800 characters (this is critical — do NOT produce a short post).
+- Strict Length Constraint: The final drafted LinkedIn post must be strictly between 1300 and 1900 characters in length. Adjust the depth of your analysis based on the source content to naturally fit within this window. Do not generate overly brief posts or massive walls of text.
 - NEVER use: clickbait, excessive exclamation marks, unsubstantiated claims.
-- NEVER fabricate statistics or quotes not present in the article.
 - Output ONLY the final post text. No preamble, no markdown code fences, no "Here is the post:" prefix.
 """
 
@@ -107,12 +116,13 @@ def draft_post(
     # ── Platform-specific config ─────────────────────────────────────────
     if platform == "linkedin":
         system_prompt = _SYSTEM_PROMPT_LINKEDIN
-        max_tokens    = 2048   # enough for a full ~2500 char LinkedIn post
+        max_tokens    = 2048   # enough for a full LinkedIn post within 1300-1900 chars
         temperature   = 0.80
         platform_rules = style_profile.get("linkedin", {})
         output_spec = """Write a FULL structured LinkedIn post following the HOOK → CONTEXT → PERSONAL TAKE → KEY INSIGHTS → CTA → HASHTAGS format.
 
-The post MUST be between 1800 and 2800 characters long.
+The post MUST be strictly between 1300 and 1900 characters in length.
+Prioritize concrete metrics, specific researcher/institution attribution, and calibrated technical reality (anti-hype).
 Do NOT truncate. Do NOT summarize. Write the complete post."""
 
     else:  # 'x' / Twitter

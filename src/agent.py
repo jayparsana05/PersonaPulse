@@ -29,7 +29,11 @@ from typing import Optional, TypedDict
 from langgraph.graph import END, StateGraph
 
 from src.canary import run_canary_check
-from src.ingestion import extract_og_image, fetch_trending_tech_news
+from src.ingestion import (
+    discover_topic_candidates,
+    extract_og_image_with_url,
+    fetch_trending_tech_news,
+)
 from src.llm import draft_post, send_telegram_alert
 from src.memory import (
     check_is_duplicate,
@@ -58,6 +62,9 @@ class AgentState(TypedDict, total=False):
 
     # Search
     article: dict                       # keys: url, title, body, published, source
+
+    # Discovery (research-agent phase)
+    topic_candidates: list              # list[TopicCandidate]
 
     # Deduplication
     embedding: list[float]
@@ -111,11 +118,11 @@ def _should_halt_after_canary(state: AgentState) -> str:
 # ---------------------------------------------------------------------------
 
 def node_search(state: AgentState) -> AgentState:
-    """Fetch the top trending tech news article via Tavily."""
+    """Fetch the top trending agentic-AI article via Tavily."""
     log.info("━━━ [Node 2/5] Search ━━━")
 
-    query = state.get("search_query", "latest AI and machine learning breakthroughs")
-    article = fetch_trending_tech_news(query=query)
+    query = state.get("search_query")
+    article = fetch_trending_tech_news(query=query or None)
 
     log.info("[Search] Article: '%s' from %s", article["title"], article["source"])
     return {**state, "article": article}
@@ -202,16 +209,19 @@ def node_store_and_alert(state: AgentState) -> AgentState:
     x_draft        = state["x_draft"]
 
     # ── Extract og:image (best-effort) ─────────────────────────────────
-    image_bytes = extract_og_image(article.get("url", ""))
+    # Returns both the og:image URL (for the posts table) and the raw
+    # image bytes (for the Telegram photo). Either may be None.
+    image_url, image_bytes = extract_og_image_with_url(article.get("url", ""))
 
     # ── Store in Supabase ───────────────────────────────────────────────
     combined_content = f"LINKEDIN:\n{linkedin_draft}\n\nX:\n{x_draft}"
     post_id = store_draft(
-        platform   = "both",
-        topic      = article["title"][:256],
-        content    = combined_content,
-        embedding  = embedding,
-        image_url  = article.get("url"),
+        platform    = "both",
+        topic       = article["title"][:256],
+        content     = combined_content,
+        embedding   = embedding,
+        article_url = article.get("url"),
+        image_url   = image_url,
     )
 
     log.info("[Store] Draft saved – id=%s", post_id)
@@ -279,14 +289,15 @@ def build_graph() -> StateGraph:
 # CLI Entry Point
 # ---------------------------------------------------------------------------
 
-def run_pipeline(query: str = "latest AI and technology news") -> dict:
+def run_pipeline(query: str = "") -> dict:
     """
     Execute the full PersonaPulse pipeline.
 
     Parameters
     ----------
     query : str
-        Tavily search query for discovering trending news.
+        Tavily search query for discovering trending news. Empty string
+        selects an agentic-AI query, rotated per run.
 
     Returns
     -------
@@ -298,7 +309,10 @@ def run_pipeline(query: str = "latest AI and technology news") -> dict:
         datefmt= "%H:%M:%S",
     )
 
-    log.info("🚀 PersonaPulse pipeline starting | query='%s'", query)
+    log.info(
+        "🚀 PersonaPulse pipeline starting | query='%s'",
+        query or "(auto-rotated agentic-AI query)",
+    )
 
     app    = build_graph()
     result = app.invoke({"search_query": query})
@@ -313,8 +327,71 @@ def run_pipeline(query: str = "latest AI and technology news") -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Phase-1 Discovery Entry Point (Research Agent)
+# ---------------------------------------------------------------------------
+# Discovery → Topic Candidates → (Selection is Phase 2).
+# Returns the clean, deduplicated list of TopicCandidate objects so the
+# next phase can consume them. Does not draft or publish anything.
+
+def run_discovery(
+    query: str = "",
+    limit: Optional[int] = None,
+) -> list:
+    """
+    Run the Phase-1 discovery stage of the research agent.
+
+    Parameters
+    ----------
+    query : str
+        Optional Tavily search query. Empty string rotates through the
+        agentic-AI query list.
+    limit : int, optional
+        Maximum number of candidates to return (defaults to the
+        configured DISCOVERY_CANDIDATE_COUNT).
+
+    Returns
+    -------
+    list[TopicCandidate]
+        The clean, deduplicated list of candidates for the next phase.
+    """
+    logging.basicConfig(
+        level  = logging.INFO,
+        format = "%(asctime)s %(levelname)-8s │ %(message)s",
+        datefmt= "%H:%M:%S",
+    )
+
+    log.info(
+        "🔎 Research Agent – Discovery | query='%s' | limit=%s",
+        query or "(auto-rotated agentic-AI query)", limit,
+    )
+
+    candidates = discover_topic_candidates(query=query or None, limit=limit)
+
+    if not candidates:
+        log.warning("🧭 Discovery returned no usable topic candidates.")
+    else:
+        for idx, candidate in enumerate(candidates, start=1):
+            log.info(
+                "  %d. [%.2f] %s — %s (%s)",
+                idx,
+                candidate.search_score,
+                candidate.title,
+                candidate.source,
+                candidate.url,
+            )
+
+    return candidates
+
+
 if __name__ == "__main__":
     print("Starting PersonaPulse Pipeline...")
-    query_arg = sys.argv[1] if len(sys.argv) > 1 else "latest AI and machine learning news"
+    args = sys.argv[1:]
+
+    if args and args[0] == "--discover":
+        discovery = run_discovery(query=args[1] if len(args) > 1 else "")
+        sys.exit(0)
+
+    query_arg = args[0] if args else ""
     final_state = run_pipeline(query=query_arg)
     sys.exit(0 if not final_state.get("pipeline_halted") else 1)

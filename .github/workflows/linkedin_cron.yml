@@ -15,9 +15,9 @@ on:
   workflow_dispatch:
     inputs:
       search_query:
-        description: "Custom Tavily search query (optional)"
+        description: "Custom Tavily search query (optional; empty = auto-rotated agentic-AI queries)"
         required: false
-        default: "latest AI and machine learning breakthroughs"
+        default: ""
 
 jobs:
   post-to-linkedin:
@@ -55,7 +55,7 @@ jobs:
 
       - name: "🚀 Run PersonaPulse Pipeline"
         run: |
-          QUERY="${{ github.event.inputs.search_query || 'latest AI and machine learning breakthroughs' }}"
+          QUERY="${{ github.event.inputs.search_query || '' }}"
           python -m src.agent "$QUERY"
 
       - name: "📋 Upload logs on failure"

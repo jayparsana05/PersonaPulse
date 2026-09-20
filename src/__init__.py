@@ -9,6 +9,22 @@ Usage:
 """
 
 from src.agent import run_pipeline
+from src.models import (
+    Claim,
+    Evidence,
+    ResearchQuestion,
+    ResearchReport,
+    ResearchSource,
+    TopicCandidate,
+)
 
-__all__ = ["run_pipeline"]
+__all__ = [
+    "run_pipeline",
+    "TopicCandidate",
+    "ResearchQuestion",
+    "ResearchSource",
+    "Evidence",
+    "Claim",
+    "ResearchReport",
+]
 __version__ = "1.0.0"
