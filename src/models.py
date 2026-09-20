@@ -10,6 +10,7 @@ They map onto the target workflow:
 Models
 ------
 - TopicCandidate   : a candidate topic surfaced during Discovery
+- TopicSelection   : the outcome of Selecting one candidate (topic + rationale)
 - ResearchQuestion : the framing question (+ aspects) for a topic
 - ResearchSource   : one source gathered during Research (backward compatible
                      with the existing ingestion article dict shape)
@@ -116,6 +117,67 @@ class TopicCandidate:
             published=str(data.get("published", "")),
             search_score=float(data.get(score_key, 0.0)),
             discovered_at=_parse_iso(data.get("discovered_at")),
+        )
+
+
+# ---------------------------------------------------------------------------
+# TopicSelection – Selection output
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TopicSelection:
+    """
+    The outcome of the Selection stage: the single chosen topic plus the
+    reasoning and criteria used to choose it.
+
+    Selection is deliberately separate from research: this model records
+    WHAT was chosen and WHY, never the research itself.
+
+    Fields
+    ------
+    selected     : the chosen TopicCandidate, or None when nothing fit
+    reasoning    : human-readable explanation of the selection
+    criteria     : list[str] of criteria the candidates were evaluated against
+    evaluations  : list[dict] of per-candidate verdicts (LLM row shape:
+                   {index, fit_score, strengths, concerns})
+    mode         : how the choice was made – "llm" | "heuristic" |
+                   "none_fit" | "empty"
+    created_at   : when the selection was made
+    """
+    selected: Optional["TopicCandidate"] = None
+    reasoning: str = ""
+    criteria: list = field(default_factory=list)
+    evaluations: list = field(default_factory=list)
+    mode: str = "llm"
+    created_at: Optional[datetime] = None
+
+    MODE_LLM = "llm"
+    MODE_HEURISTIC = "heuristic"
+    MODE_NONE_FIT = "none_fit"
+    MODE_EMPTY = "empty"
+
+    def to_dict(self) -> dict:
+        return {
+            "selected": self.selected.to_dict() if self.selected is not None else None,
+            "reasoning": self.reasoning,
+            "criteria": list(self.criteria),
+            "evaluations": list(self.evaluations),
+            "mode": self.mode,
+            "created_at": _iso(self.created_at),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TopicSelection":
+        selected = data.get("selected")
+        return cls(
+            selected=(
+                TopicCandidate.from_dict(selected) if isinstance(selected, dict) else None
+            ),
+            reasoning=str(data.get("reasoning", "")),
+            criteria=list(data.get("criteria") or []),
+            evaluations=list(data.get("evaluations") or []),
+            mode=str(data.get("mode", cls.MODE_LLM)),
+            created_at=_parse_iso(data.get("created_at")),
         )
 
 
@@ -337,6 +399,7 @@ class ResearchReport:
 
 __all__ = [
     "TopicCandidate",
+    "TopicSelection",
     "ResearchQuestion",
     "ResearchSource",
     "Evidence",

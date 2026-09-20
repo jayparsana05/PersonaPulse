@@ -43,6 +43,24 @@ AGENTIC_SEARCH_QUERIES: list[str] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Topic-selection criteria for the Engineering Research Agent.
+# The Selector evaluates every discovered candidate against all of these.
+# Edit here to steer what the research agent chooses to deep-dive on.
+# ---------------------------------------------------------------------------
+TOPIC_SELECTION_CRITERIA: list[str] = [
+    "Engineering relevance: builds, deploys, debugs, or operates agentic AI "
+    "systems (agent frameworks, orchestration, memory, tool use, evaluation, "
+    "reliability, observability).",
+    "Technical depth: concrete frameworks, patterns, benchmarks, or incident "
+    "reports rather than pure hype or product announcements.",
+    "Novelty: recent (last 7 days) and non-obvious, adding a fresh angle to "
+    "the existing knowledge base.",
+    "Actionability: an engineer can apply or learn something from it this week.",
+    "Source quality: reputable engineering blogs, vendor engineering posts, "
+    "papers, or substantive journalism.",
+]
+
+# ---------------------------------------------------------------------------
 # Load .env file from the project root (two levels up from src/)
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -185,4 +203,4 @@ settings = Settings(
     DISCOVERY_CANDIDATE_COUNT=_optional_int("DISCOVERY_CANDIDATE_COUNT", 5),
 )
 
-__all__ = ["settings", "EXCLUDED_SEARCH_DOMAINS", "AGENTIC_SEARCH_QUERIES"]
+__all__ = ["settings", "EXCLUDED_SEARCH_DOMAINS", "AGENTIC_SEARCH_QUERIES", "TOPIC_SELECTION_CRITERIA"]

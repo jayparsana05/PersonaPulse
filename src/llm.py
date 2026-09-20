@@ -8,6 +8,7 @@ Interfaces with Google Gemini Flash 2.0 for:
 Key Functions
 -------------
 - draft_post(article, style_profile, platform) → str
+- complete_text(system_prompt, user_prompt, max_tokens, temperature) → str
 - send_telegram_alert(post_id, drafts, image_bytes, article_url)
 """
 
@@ -208,6 +209,71 @@ Write the {platform.upper()} post now:""".strip()
     if last_error:
         raise last_error
     raise RuntimeError(f"Failed to generate draft for {platform}: model returned empty response.")
+
+
+# ---------------------------------------------------------------------------
+# Public: Generic text completion (reused by the research-agent phases)
+# ---------------------------------------------------------------------------
+
+def complete_text(
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 512,
+    temperature: float = 0.2,
+) -> str:
+    """
+    Run a single LLM completion through the shared Gemini client, retrying
+    across settings.LLM_MODEL and the configured fallback models.
+
+    Returns the trimmed response text. Raises if every model fails or all
+    return empty responses. Reused by the research-agent phases (topic
+    selection, question framing) so they share the same client/fallback
+    behavior as draft_post.
+    """
+    client = _get_gemini()
+
+    last_error: Exception | None = None
+    models_to_try = [settings.LLM_MODEL] + settings.fallback_models
+
+    for attempt_idx, model_name in enumerate(models_to_try):
+        try:
+            if attempt_idx > 0:
+                log.warning(
+                    "[LLM] Retrying completion using fallback model '%s'...",
+                    model_name,
+                )
+            chat = client.chats.create(
+                model=model_name,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                ),
+            )
+            response = chat.send_message(user_prompt)
+            text = response.text.strip() if response.text else ""
+            if text:
+                if attempt_idx > 0:
+                    log.warning(
+                        "[LLM] Completion succeeded using fallback model '%s'",
+                        model_name,
+                    )
+                return text
+        except Exception as exc:
+            last_error = exc
+            next_model = models_to_try[attempt_idx + 1] if attempt_idx + 1 < len(models_to_try) else None
+            log.warning(
+                "[LLM] Model '%s' failed for completion: %s. %s",
+                model_name,
+                exc,
+                f"Trying fallback model '{next_model}'..." if next_model else "No further fallback models.",
+            )
+            if next_model:
+                time.sleep(1)
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Failed to generate completion: model returned empty response.")
 
 
 # ---------------------------------------------------------------------------

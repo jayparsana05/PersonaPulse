@@ -18,6 +18,8 @@ Entry Points
 ------------
     python -m src.agent                          # run with default query
     python -m src.agent "quantum computing news" # custom query
+    python -m src.agent --discover               # Phase-1 discovery only
+    python -m src.agent --select                 # discover → select → frame question
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ from src.memory import (
     get_style_profile,
     store_draft,
 )
+from src.selection import frame_question, select_topic
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +68,10 @@ class AgentState(TypedDict, total=False):
 
     # Discovery (research-agent phase)
     topic_candidates: list              # list[TopicCandidate]
+
+    # Selection (research-agent phase)
+    selection: dict                     # TopicSelection dict (selected + reasoning)
+    research_question: dict             # ResearchQuestion dict for the selected topic
 
     # Deduplication
     embedding: list[float]
@@ -384,12 +391,91 @@ def run_discovery(
     return candidates
 
 
+# ---------------------------------------------------------------------------
+# Phase-2 Selection Entry Point (Research Agent)
+# ---------------------------------------------------------------------------
+# Discover → TopicCandidates → Select → ResearchQuestion.
+# Selection stays separate from research: this stage chooses ONE topic and
+# frames the research question, but does NOT research, draft, or publish.
+
+def run_selection(
+    query: str = "",
+    limit: Optional[int] = None,
+    candidates: Optional[list] = None,
+) -> dict:
+    """
+    Run the Select Topic stage of the research agent.
+
+    Parameters
+    ----------
+    query : str
+        Optional Tavily search query. Empty string rotates through the
+        agentic-AI query list.
+    limit : int, optional
+        Maximum number of candidates to discover (defaults to the
+        configured DISCOVERY_CANDIDATE_COUNT).
+    candidates : list[TopicCandidate], optional
+        Pre-discovered candidates; when provided, discovery is skipped
+        (useful for tests and for running selection against existing
+        candidates).
+
+    Returns
+    -------
+    dict with keys:
+        topic_candidates : list[TopicCandidate] (discovered, may be empty)
+        selection        : TopicSelection (selected + reasoning + criteria)
+        research_question: ResearchQuestion or None (when nothing was selected)
+    """
+    logging.basicConfig(
+        level  = logging.INFO,
+        format = "%(asctime)s %(levelname)-8s │ %(message)s",
+        datefmt= "%H:%M:%S",
+    )
+
+    log.info(
+        "🔎 Research Agent – Select Topic | query='%s' | limit=%s | candidates=%s",
+        query or "(auto-rotated agentic-AI query)", limit,
+        "provided" if candidates is not None else "discover",
+    )
+
+    if candidates is None:
+        candidates = discover_topic_candidates(query=query or None, limit=limit)
+
+    selection = select_topic(candidates, query=query)
+
+    if selection.selected is not None:
+        log.info(
+            "  ✔ Selected: [%s] %s — %s",
+            selection.mode, selection.selected.title, selection.selected.url,
+        )
+        log.info("  Reasoning: %s", selection.reasoning[:200])
+    else:
+        log.warning("  ✖ No topic selected (mode=%s): %s", selection.mode, selection.reasoning)
+
+    question = frame_question(selection.selected, query=query)
+
+    if question is not None:
+        log.info("  ❓ Research question: %s", question.question)
+        if question.aspects:
+            log.info("  Aspects: %s", ", ".join(question.aspects))
+
+    return {
+        "topic_candidates": list(candidates),
+        "selection": selection,
+        "research_question": question,
+    }
+
+
 if __name__ == "__main__":
     print("Starting PersonaPulse Pipeline...")
     args = sys.argv[1:]
 
     if args and args[0] == "--discover":
         discovery = run_discovery(query=args[1] if len(args) > 1 else "")
+        sys.exit(0)
+
+    if args and args[0] == "--select":
+        result = run_selection(query=args[1] if len(args) > 1 else "")
         sys.exit(0)
 
     query_arg = args[0] if args else ""

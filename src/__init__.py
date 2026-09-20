@@ -8,7 +8,7 @@ Usage:
     run_pipeline("latest AI news")
 """
 
-from src.agent import run_pipeline
+from src.agent import run_pipeline, run_selection
 from src.models import (
     Claim,
     Evidence,
@@ -16,11 +16,14 @@ from src.models import (
     ResearchReport,
     ResearchSource,
     TopicCandidate,
+    TopicSelection,
 )
 
 __all__ = [
     "run_pipeline",
+    "run_selection",
     "TopicCandidate",
+    "TopicSelection",
     "ResearchQuestion",
     "ResearchSource",
     "Evidence",
