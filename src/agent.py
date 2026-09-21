@@ -20,7 +20,7 @@ Entry Points
     python -m src.agent "quantum computing news" # custom query
     python -m src.agent --discover               # Phase-1 discovery only
     python -m src.agent --select                 # discover → select → frame question
-    python -m src.agent --research "question"    # Prompt-4 research on a bare question
+    python -m src.agent --research "question"    # Prompt-4 multi-source research (stores question + linked sources)
 """
 
 from __future__ import annotations
@@ -467,14 +467,7 @@ def run_selection(
         log.info("  ❓ Research question: %s", question.question)
         if question.aspects:
             log.info("  Aspects: %s", ", ".join(question.aspects))
-        try:
-            question_id = store_research_question(question)
-            log.info("  💾 Research question stored – id=%s", question_id)
-        except Exception as exc:  # pylint: disable=broad-except
-            log.warning(
-                "⚠️  Could not persist research question (%s: %s) – continuing.",
-                type(exc).__name__, exc,
-            )
+        question_id = persist_research_question(question)
 
     return {
         "topic_candidates": list(candidates),
@@ -482,6 +475,21 @@ def run_selection(
         "research_question": question,
         "research_question_id": question_id,
     }
+
+
+def persist_research_question(rq) -> Optional[str]:
+    """Persist a ResearchQuestion and return its UUID, or None when the store
+    is unavailable. Non-blocking: callers continue in-memory either way."""
+    try:
+        question_id = store_research_question(rq)
+        log.info("  💾 Research question stored – id=%s", question_id)
+        return question_id
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(
+            "⚠️  Could not persist research question (%s: %s) – continuing.",
+            type(exc).__name__, exc,
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +595,8 @@ if __name__ == "__main__":
             question=args[1] if len(args) > 1 else "",
             aspects=[],
         )
-        result = run_research(rq)
+        question_id = persist_research_question(rq)
+        result = run_research(rq, research_question_id=question_id)
         sys.exit(0)
 
     query_arg = args[0] if args else ""

@@ -41,7 +41,7 @@ for _key, _value in _REQUIRED_ENV.items():
     os.environ.setdefault(_key, _value)
 
 from src.research import generate_research_queries, research_question  # noqa: E402
-from src.agent import run_research  # noqa: E402
+from src.agent import persist_research_question, run_research  # noqa: E402
 from src.models import ResearchQuestion, ResearchSource  # noqa: E402
 
 
@@ -483,6 +483,33 @@ class RunResearchTest(unittest.TestCase):
         self.assertEqual(result["research_sources"], [])
         self.assertEqual(result["status"], "empty")
         store.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Research question persistence (used to link stored sources to their session)
+# ---------------------------------------------------------------------------
+
+class PersistResearchQuestionTest(unittest.TestCase):
+    def test_returns_uuid_when_store_succeeds(self):
+        with patch("src.agent.store_research_question", return_value="qid-9") as store:
+            question_id = persist_research_question(research_question_fixture())
+        self.assertEqual(question_id, "qid-9")
+        store.assert_called_once_with(research_question_fixture())
+
+    def test_returns_none_when_store_is_unavailable(self):
+        with patch("src.agent.store_research_question", side_effect=RuntimeError("db down")):
+            question_id = persist_research_question(research_question_fixture())
+        self.assertIsNone(question_id)
+
+    def test_stored_question_id_links_to_persisted_sources(self):
+        with patch("src.agent.store_research_question", return_value="qid-9") as store, \
+             patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+             patch("src.research.search_news", return_value=[raw_result()]), \
+             patch("src.agent.store_research_sources", return_value=["id-1"]) as sources_store:
+            result = run_research(research_question_fixture(), research_question_id=store.return_value)
+        sources_store.assert_called_once()
+        self.assertEqual(sources_store.call_args.args[0], "qid-9")
+        self.assertEqual(result["research_source_ids"], ["id-1"])
 
 
 if __name__ == "__main__":
