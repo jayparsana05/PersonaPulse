@@ -157,6 +157,18 @@ class Settings:
     RESEARCH_MAX_SOURCES: int = 10
     RESEARCH_MIN_SCORE: float = 0.1
 
+    # ── Evidence (Phase 3, step 1) ─────────────────────────────────────────
+    # EVIDENCE_MAX_CLAIMS_PER_SOURCE – max validated claims kept per source,
+    #                                   per research question.
+    # EVIDENCE_SOURCE_BODY_CHARS     – max characters of each source body sent
+    #                                   to the LLM during evidence extraction.
+    #                                   Sources shorter than this pass fully;
+    #                                   longer sources are trimmed. Keeps token
+    #                                   usage bounded while allowing far more
+    #                                   source content than the original 2000.
+    EVIDENCE_MAX_CLAIMS_PER_SOURCE: int = 5
+    EVIDENCE_SOURCE_BODY_CHARS: int = 8000
+
     @property
     def fallback_models(self) -> list[str]:
         """Ordered list of fallback models to try if the primary model fails or is overloaded."""
@@ -229,6 +241,9 @@ settings = Settings(
     RESEARCH_MAX_SOURCES_PER_QUERY=_optional_int("RESEARCH_MAX_SOURCES_PER_QUERY", 5),
     RESEARCH_MAX_SOURCES=_optional_int("RESEARCH_MAX_SOURCES", 10),
     RESEARCH_MIN_SCORE=_optional_float("RESEARCH_MIN_SCORE", 0.1),
+    # Evidence tuning (Phase 3, step 1)
+    EVIDENCE_MAX_CLAIMS_PER_SOURCE=_optional_int("EVIDENCE_MAX_CLAIMS_PER_SOURCE", 5),
+    EVIDENCE_SOURCE_BODY_CHARS=_optional_int("EVIDENCE_SOURCE_BODY_CHARS", 8000),
 )
 
 __all__ = ["settings", "EXCLUDED_SEARCH_DOMAINS", "AGENTIC_SEARCH_QUERIES", "TOPIC_SELECTION_CRITERIA"]

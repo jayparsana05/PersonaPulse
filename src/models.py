@@ -306,11 +306,25 @@ class Evidence:
     A single claim pulled from a source during the Evidence stage, including
     attribution and a verification status:
       claimed → corroborated | contradicted
+
+    Fields
+    ------
+    claim_text         : the extracted claim (factual assertion)
+    source_url         : the URL the claim is traceable to (required in practice;
+                         defaults to None so empty dicts still deserialize)
+    supporting_quote   : verbatim snippet from the source backing the claim
+    confidence         : 0.0–1.0 extraction confidence
+    context            : surrounding context that makes the claim meaningful
+    directly_supports  : True when the source states the claim directly,
+                         False when it only implies/relates to it
+    verification_status: claimed | corroborated | contradicted
     """
     claim_text: str
     source_url: Optional[str] = None
     supporting_quote: str = ""
     confidence: float = 0.0         # 0.0–1.0
+    context: str = ""
+    directly_supports: bool = True
     verification_status: str = "claimed"
 
     VERIFICATION_CLAIMED = "claimed"
@@ -323,6 +337,8 @@ class Evidence:
             "source_url": self.source_url,
             "supporting_quote": self.supporting_quote,
             "confidence": self.confidence,
+            "context": self.context,
+            "directly_supports": self.directly_supports,
             "verification_status": self.verification_status,
         }
 
@@ -333,6 +349,8 @@ class Evidence:
             source_url=data.get("source_url"),
             supporting_quote=str(data.get("supporting_quote", "")),
             confidence=float(data.get("confidence", 0.0)),
+            context=str(data.get("context", "")),
+            directly_supports=bool(data.get("directly_supports", True)),
             verification_status=str(
                 data.get("verification_status", cls.VERIFICATION_CLAIMED)
             ),

@@ -170,6 +170,28 @@ class EvidenceTest(unittest.TestCase):
         restored = Evidence.from_dict(evidence.to_dict())
         self.assertEqual(restored, evidence)
 
+    def test_context_and_direct_support_fields(self):
+        evidence = Evidence(
+            claim_text="X scales to 1M agents",
+            source_url="https://example.com/report",
+            supporting_quote="Benchmarks show 1M coordinated agents.",
+            confidence=0.9,
+            context="Benchmarking study across three frameworks.",
+            directly_supports=False,
+        )
+        restored = Evidence.from_dict(evidence.to_dict())
+        self.assertEqual(restored, evidence)
+        self.assertEqual(restored.context, "Benchmarking study across three frameworks.")
+        self.assertFalse(restored.directly_supports)
+
+    def test_context_and_direct_support_defaults(self):
+        evidence = Evidence(claim_text="Plain claim")
+        self.assertEqual(evidence.context, "")
+        self.assertTrue(evidence.directly_supports)
+        restored = Evidence.from_dict({"claim_text": "Plain claim"})
+        self.assertEqual(restored.context, "")
+        self.assertTrue(restored.directly_supports)
+
 
 class ResearchReportTest(unittest.TestCase):
     def _sample_report(self) -> ResearchReport:

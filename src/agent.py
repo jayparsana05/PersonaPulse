@@ -21,6 +21,7 @@ Entry Points
     python -m src.agent --discover               # Phase-1 discovery only
     python -m src.agent --select                 # discover → select → frame question
     python -m src.agent --research "question"    # Prompt-4 multi-source research (stores question + linked sources)
+    python -m src.agent --evidence "question"    # Phase-3 evidence extraction (research → claims), no drafting
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from typing import Optional, TypedDict
 from langgraph.graph import END, StateGraph
 
 from src.canary import run_canary_check
+from src.evidence import extract_evidence as evidence_stage
 from src.ingestion import (
     discover_topic_candidates,
     extract_og_image_with_url,
@@ -577,6 +579,68 @@ def run_research(
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase-3 Evidence Entry Point (Research Agent)
+# ---------------------------------------------------------------------------
+# ResearchQuestion + ResearchSource[] → evidence_stage() → Evidence[].
+# Evidence extraction stays strictly separated from synthesis: no prose, no
+# report, no LinkedIn drafting here (that is a later phase).
+
+def run_evidence(
+    research_question=None,
+    research_sources=None,
+    research_question_id: Optional[str] = None,
+    use_llm: bool = True,
+    max_claims_per_source: Optional[int] = None,
+) -> dict:
+    """
+    Run the Phase-3 evidence stage for a research question + its sources.
+
+    Parameters
+    ----------
+    research_question : ResearchQuestion, optional
+        The framed question the claims should relate to (None → no evidence).
+    research_sources  : list[ResearchSource], optionally
+        The collected, deduplicated sources to extract claims from.
+    research_question_id : str, optional
+        Kept for traceability parity with run_research; not required for
+        extraction and reserved for a future persistence step.
+    use_llm / max_claims_per_source : passed through to evidence_stage.
+
+    Returns
+    -------
+    dict with keys:
+        research_question : the ResearchQuestion the evidence relates to
+        research_sources  : list[ResearchSource] the evidence came from
+        evidence          : list[Evidence] (supported, source-attributed claims)
+        status            : "ok" when ≥1 claim extracted, else "empty"
+    """
+    logging.basicConfig(
+        level  = logging.INFO,
+        format = "%(asctime)s %(levelname)-8s │ %(message)s",
+        datefmt= "%H:%M:%S",
+    )
+
+    sources = list(research_sources or [])
+    log.info("🧠 Research Agent – Evidence | question='%s' | sources=%d",
+             getattr(research_question, "question", research_question), len(sources))
+
+    evidence = evidence_stage(
+        research_question,
+        sources,
+        use_llm=use_llm,
+        max_claims_per_source=max_claims_per_source,
+    )
+    log.info("  📎 Evidence extraction complete: %d claim(s) | status=%s",
+             len(evidence), "ok" if evidence else "empty")
+    return {
+        "research_question": research_question,
+        "research_sources": sources,
+        "evidence": evidence,
+        "status": "ok" if evidence else "empty",
+    }
+
+
 if __name__ == "__main__":
     print("Starting PersonaPulse Pipeline...")
     args = sys.argv[1:]
@@ -597,6 +661,21 @@ if __name__ == "__main__":
         )
         question_id = persist_research_question(rq)
         result = run_research(rq, research_question_id=question_id)
+        sys.exit(0)
+
+    if args and args[0] == "--evidence":
+        rq = ResearchQuestion(
+            topic=args[1] if len(args) > 1 else "",
+            question=args[1] if len(args) > 1 else "",
+            aspects=[],
+        )
+        question_id = persist_research_question(rq)
+        research = run_research(rq, research_question_id=question_id)
+        result = run_evidence(
+            research["research_question"],
+            research["research_sources"],
+            research_question_id=question_id,
+        )
         sys.exit(0)
 
     query_arg = args[0] if args else ""
