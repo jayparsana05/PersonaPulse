@@ -23,6 +23,7 @@ Entry Points
     python -m src.agent --research "question"    # Prompt-4 multi-source research (stores question + linked sources)
     python -m src.agent --evidence "question"    # Phase-3 evidence extraction (research → claims), no drafting
     python -m src.agent --analyze "question"     # Phase-3 critical analysis (research → evidence → analysis), no drafting
+    python -m src.agent --report "question"      # Phase-3 report synthesis (research → evidence → analysis → report), no drafting
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ from src.memory import (
     store_research_sources,
 )
 from src.models import ResearchQuestion
+from src.report import synthesize_report as report_stage
 from src.research import research_question as research_stage
 from src.selection import frame_question, select_topic
 
@@ -700,6 +702,76 @@ def run_critical_analysis(
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase-3 ResearchReport Synthesis Entry Point (Research Agent)
+# ---------------------------------------------------------------------------
+# ResearchQuestion + ResearchSource[] + Evidence[] + CriticalAnalysis
+# → report_stage() → ResearchReport. Assembles the structured report; the
+# product lives in a research document. LinkedIn drafting is a later phase.
+
+def run_report(
+    research_question=None,
+    research_sources=None,
+    evidence=None,
+    analysis=None,
+    research_question_id: Optional[str] = None,
+    use_llm: bool = True,
+) -> dict:
+    """
+    Run the Phase-3 report synthesis stage for a research session.
+
+    Parameters
+    ----------
+    research_question : ResearchQuestion, optional
+    research_sources  : list[ResearchSource], optional  – collected sources
+    evidence          : list[Evidence], optional        – extracted claims
+    analysis          : CriticalAnalysis, optional      – critical analysis
+    research_question_id : str, optional
+        Traceability parity with the earlier stages; reserved for persistence.
+    use_llm : bool
+        Passed through to report_stage; False → deterministic report.
+
+    Returns
+    -------
+    dict with keys:
+        research_question : the ResearchQuestion the report relates to
+        sources           : list[ResearchSource] in the report
+        evidence          : list[Evidence] in the report
+        analysis          : CriticalAnalysis carried into the report (or None)
+        report            : ResearchReport (structured, LinkedIn-agnostic)
+        status            : "ok" when the report has content, else "empty"
+    """
+    logging.basicConfig(
+        level  = logging.INFO,
+        format = "%(asctime)s %(levelname)-8s │ %(message)s",
+        datefmt= "%H:%M:%S",
+    )
+
+    sources = list(research_sources or [])
+    items = list(evidence or [])
+    log.info("🧠 Research Agent – Report Synthesis | question='%s' | sources=%d evidence=%d",
+             getattr(research_question, "question", research_question), len(sources), len(items))
+
+    report = report_stage(
+        research_question,
+        sources,
+        items,
+        analysis=analysis,
+        use_llm=use_llm,
+    )
+    status = "ok" if (report.findings or report.evidence or report.sources) else "empty"
+    log.info("  📄 Report assembled: %d finding(s), %d conclusion(s) | status=%s",
+             len(report.findings), len(report.conclusions), status)
+    return {
+        "research_question": research_question,
+        "sources": sources,
+        "evidence": items,
+        "analysis": analysis,
+        "report": report,
+        "status": status,
+    }
+
+
 if __name__ == "__main__":
     print("Starting PersonaPulse Pipeline...")
     args = sys.argv[1:]
@@ -753,6 +825,33 @@ if __name__ == "__main__":
         result = run_critical_analysis(
             evidence_result["research_question"],
             evidence_result["evidence"],
+            research_question_id=question_id,
+        )
+        sys.exit(0)
+
+    if args and args[0] == "--report":
+        rq = ResearchQuestion(
+            topic=args[1] if len(args) > 1 else "",
+            question=args[1] if len(args) > 1 else "",
+            aspects=[],
+        )
+        question_id = persist_research_question(rq)
+        research = run_research(rq, research_question_id=question_id)
+        evidence_result = run_evidence(
+            research["research_question"],
+            research["research_sources"],
+            research_question_id=question_id,
+        )
+        analysis_result = run_critical_analysis(
+            evidence_result["research_question"],
+            evidence_result["evidence"],
+            research_question_id=question_id,
+        )
+        result = run_report(
+            research["research_question"],
+            research["research_sources"],
+            evidence_result["evidence"],
+            analysis_result["analysis"],
             research_question_id=question_id,
         )
         sys.exit(0)

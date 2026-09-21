@@ -533,26 +533,62 @@ class CriticalAnalysis:
 @dataclass
 class ResearchReport:
     """
-    The assembled output document combining questions, sources, and evidence
-    with the critical analysis/synthesis narrative and conclusions.
+    The assembled research report combining topic, research question, sources,
+    evidence/claims, and the CriticalAnalysis into a structured document.
+
+    Sections
+    --------
+    - topic / research_question : what was researched
+    - findings                  : key findings, each traceable to its evidence
+                                  (list[ClaimAnalysis])
+    - supporting_evidence / conflicting_evidence : evidence backing findings
+    - counterarguments / limitations / uncertainties / unresolved_questions
+                                : carried through from the CriticalAnalysis
+    - sources                   : the source list
+    - evidence                  : the full extracted evidence (with references)
+    - summary / conclusions / synthesis : the assembled narrative (grounded
+                                  only in collected research; LinkedIn-agnostic)
+    - confidence_score          : aggregate confidence across evidence
     """
     topic: str
+    research_question: str = ""
     summary: str = ""                       # Critical Analysis + Synthesis narrative
     conclusions: list = field(default_factory=list)
     questions: list = field(default_factory=list)   # list[ResearchQuestion]
     sources: list = field(default_factory=list)     # list[ResearchSource]
     evidence: list = field(default_factory=list)    # list[Evidence]
+    findings: list = field(default_factory=list)    # list[ClaimAnalysis]
+    supporting_evidence: list = field(default_factory=list)   # list[Evidence]
+    conflicting_evidence: list = field(default_factory=list)  # list[Evidence]
+    counterarguments: list = field(default_factory=list)      # list[Counterargument]
+    limitations: list = field(default_factory=list)           # list[str]
+    uncertainties: list = field(default_factory=list)         # list[str]
+    unresolved_questions: list = field(default_factory=list)  # list[str]
+    synthesis: str = ""
+    synthesis_segments: list = field(default_factory=list)  # list[str] – validated LLM segments (order kept)
+    analysis: Optional = None               # CriticalAnalysis | None
     confidence_score: float = 0.0
     created_at: Optional[datetime] = None
 
     def to_dict(self) -> dict:
         return {
             "topic": self.topic,
+            "research_question": self.research_question,
             "summary": self.summary,
             "conclusions": list(self.conclusions),
             "questions": [q.to_dict() for q in self.questions],
             "sources": [s.to_dict() for s in self.sources],
             "evidence": [e.to_dict() for e in self.evidence],
+            "findings": [f.to_dict() for f in self.findings],
+            "supporting_evidence": [e.to_dict() for e in self.supporting_evidence],
+            "conflicting_evidence": [e.to_dict() for e in self.conflicting_evidence],
+            "counterarguments": [c.to_dict() for c in self.counterarguments],
+            "limitations": list(self.limitations),
+            "uncertainties": list(self.uncertainties),
+            "unresolved_questions": list(self.unresolved_questions),
+            "synthesis": self.synthesis,
+            "synthesis_segments": list(self.synthesis_segments),
+            "analysis": self.analysis.to_dict() if self.analysis else None,
             "confidence_score": self.confidence_score,
             "created_at": _iso(self.created_at),
         }
@@ -561,6 +597,7 @@ class ResearchReport:
     def from_dict(cls, data: dict) -> "ResearchReport":
         return cls(
             topic=str(data.get("topic", "")),
+            research_question=str(data.get("research_question", "")),
             summary=str(data.get("summary", "")),
             conclusions=list(data.get("conclusions") or []),
             questions=[
@@ -575,6 +612,32 @@ class ResearchReport:
                 Evidence.from_dict(item)
                 for item in (data.get("evidence") or [])
             ],
+            findings=[
+                ClaimAnalysis.from_dict(item)
+                for item in (data.get("findings") or [])
+            ],
+            supporting_evidence=[
+                Evidence.from_dict(item)
+                for item in (data.get("supporting_evidence") or [])
+            ],
+            conflicting_evidence=[
+                Evidence.from_dict(item)
+                for item in (data.get("conflicting_evidence") or [])
+            ],
+            counterarguments=[
+                Counterargument.from_dict(item)
+                for item in (data.get("counterarguments") or [])
+            ],
+            limitations=list(data.get("limitations") or []),
+            uncertainties=list(data.get("uncertainties") or []),
+            unresolved_questions=list(data.get("unresolved_questions") or []),
+            synthesis=str(data.get("synthesis", "")),
+            synthesis_segments=list(data.get("synthesis_segments") or []),
+            analysis=(
+                CriticalAnalysis.from_dict(data["analysis"])
+                if isinstance(data.get("analysis"), dict)
+                else None
+            ),
             confidence_score=float(data.get("confidence_score", 0.0)),
             created_at=_parse_iso(data.get("created_at")),
         )
