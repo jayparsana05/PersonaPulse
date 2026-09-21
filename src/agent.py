@@ -22,6 +22,7 @@ Entry Points
     python -m src.agent --select                 # discover → select → frame question
     python -m src.agent --research "question"    # Prompt-4 multi-source research (stores question + linked sources)
     python -m src.agent --evidence "question"    # Phase-3 evidence extraction (research → claims), no drafting
+    python -m src.agent --analyze "question"     # Phase-3 critical analysis (research → evidence → analysis), no drafting
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from typing import Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
+from src.analysis import analyze_evidence as analysis_stage
 from src.canary import run_canary_check
 from src.evidence import extract_evidence as evidence_stage
 from src.ingestion import (
@@ -641,6 +643,63 @@ def run_evidence(
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase-3 Critical Analysis Entry Point (Research Agent)
+# ---------------------------------------------------------------------------
+# ResearchQuestion + Evidence[] → analysis_stage() → CriticalAnalysis.
+# Produces structured analysis only (claims, counterarguments, limitations,
+# uncertainties); synthesis and LinkedIn drafting are later phases.
+
+def run_critical_analysis(
+    research_question=None,
+    evidence=None,
+    research_question_id: Optional[str] = None,
+    use_llm: bool = True,
+) -> dict:
+    """
+    Run the Phase-3 critical analysis stage for a question + its evidence.
+
+    Parameters
+    ----------
+    research_question : ResearchQuestion, optional
+        The framed question the analysis relates to (None → empty analysis).
+    evidence          : list[Evidence], optional
+        The extracted, source-attributed claims to analyse.
+    research_question_id : str, optional
+        Kept for traceability parity with run_research/run_evidence; not
+        required for analysis and reserved for a future persistence step.
+    use_llm : bool
+        Passed through to analysis_stage; False → empty analysis.
+
+    Returns
+    -------
+    dict with keys:
+        research_question : the ResearchQuestion the analysis relates to
+        evidence          : list[Evidence] the analysis was built from
+        analysis          : CriticalAnalysis (structured, for later synthesis)
+        status            : "ok" when analysis has content, else "empty"
+    """
+    logging.basicConfig(
+        level  = logging.INFO,
+        format = "%(asctime)s %(levelname)-8s │ %(message)s",
+        datefmt= "%H:%M:%S",
+    )
+
+    items = list(evidence or [])
+    log.info("🧠 Research Agent – Critical Analysis | question='%s' | evidence=%d",
+             getattr(research_question, "question", research_question), len(items))
+
+    analysis = analysis_stage(research_question, items, use_llm=use_llm)
+    log.info("  🔎 Analysis complete: %d claim(s) | status=%s",
+             len(analysis.claims), analysis.status)
+    return {
+        "research_question": research_question,
+        "evidence": items,
+        "analysis": analysis,
+        "status": analysis.status,
+    }
+
+
 if __name__ == "__main__":
     print("Starting PersonaPulse Pipeline...")
     args = sys.argv[1:]
@@ -674,6 +733,26 @@ if __name__ == "__main__":
         result = run_evidence(
             research["research_question"],
             research["research_sources"],
+            research_question_id=question_id,
+        )
+        sys.exit(0)
+
+    if args and args[0] == "--analyze":
+        rq = ResearchQuestion(
+            topic=args[1] if len(args) > 1 else "",
+            question=args[1] if len(args) > 1 else "",
+            aspects=[],
+        )
+        question_id = persist_research_question(rq)
+        research = run_research(rq, research_question_id=question_id)
+        evidence_result = run_evidence(
+            research["research_question"],
+            research["research_sources"],
+            research_question_id=question_id,
+        )
+        result = run_critical_analysis(
+            evidence_result["research_question"],
+            evidence_result["evidence"],
             research_question_id=question_id,
         )
         sys.exit(0)

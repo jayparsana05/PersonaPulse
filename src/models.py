@@ -16,6 +16,9 @@ Models
                      with the existing ingestion article dict shape)
 - Evidence         : a claim pulled from a source, with attribution
                      (Claim is provided as an alias)
+- CriticalAnalysis : structured analysis of a question's evidence (major
+                     claims + classifications + counterarguments/limitations)
+                     built from ClaimAnalysis / Counterargument
 - ResearchReport   : the assembled, analysed document synthesizing the above
 
 Every model provides to_dict()/from_dict() so the existing LangGraph state
@@ -362,6 +365,168 @@ Claim = Evidence
 
 
 # ---------------------------------------------------------------------------
+# CriticalAnalysis – Critical Analysis output
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ClaimAnalysis:
+    """
+    One major claim surfaced by the Critical Analysis stage, together with the
+    evidence that supports or contradicts it and its epistemic classification.
+
+    Classification distinguishes documented fact / interpretation / opinion /
+    unresolved question. Supporting and conflicting entries reuse the Evidence
+    model, so every evidence-backed statement keeps its source reference and
+    supporting quote verbatim.
+    """
+    claim: str
+    classification: str = "interpretation"
+    supporting_evidence: list = field(default_factory=list)   # list[Evidence]
+    conflicting_evidence: list = field(default_factory=list)  # list[Evidence]
+    confidence: float = 0.0
+    reasoning: str = ""
+    limitations: list = field(default_factory=list)           # list[str]
+
+    CLASSIFICATION_FACT = "documented_fact"
+    CLASSIFICATION_INTERPRETATION = "interpretation"
+    CLASSIFICATION_OPINION = "opinion"
+    CLASSIFICATION_UNRESOLVED = "unresolved_question"
+    CLASSIFICATIONS = (
+        CLASSIFICATION_FACT,
+        CLASSIFICATION_INTERPRETATION,
+        CLASSIFICATION_OPINION,
+        CLASSIFICATION_UNRESOLVED,
+    )
+
+    @property
+    def source_urls(self) -> list[str]:
+        """Every source URL referenced by this claim's evidence (order-preserved)."""
+        urls: list[str] = []
+        for item in list(self.supporting_evidence) + list(self.conflicting_evidence):
+            if item.source_url and item.source_url not in urls:
+                urls.append(item.source_url)
+        return urls
+
+    @property
+    def has_evidence(self) -> bool:
+        return bool(self.supporting_evidence or self.conflicting_evidence)
+
+    def to_dict(self) -> dict:
+        return {
+            "claim": self.claim,
+            "classification": self.classification,
+            "supporting_evidence": [e.to_dict() for e in self.supporting_evidence],
+            "conflicting_evidence": [e.to_dict() for e in self.conflicting_evidence],
+            "confidence": self.confidence,
+            "reasoning": self.reasoning,
+            "limitations": list(self.limitations),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ClaimAnalysis":
+        return cls(
+            claim=str(data.get("claim", "")),
+            classification=str(data.get("classification", cls.CLASSIFICATION_INTERPRETATION)),
+            supporting_evidence=[
+                Evidence.from_dict(item) for item in (data.get("supporting_evidence") or [])
+            ],
+            conflicting_evidence=[
+                Evidence.from_dict(item) for item in (data.get("conflicting_evidence") or [])
+            ],
+            confidence=float(data.get("confidence", 0.0)),
+            reasoning=str(data.get("reasoning", "")),
+            limitations=list(data.get("limitations") or []),
+        )
+
+
+@dataclass
+class Counterargument:
+    """
+    A counterargument grounded in the researched material. ``evidence`` holds
+    the Evidence entries it is based on; a counterargument with no grounding is
+    never produced (nothing is invented).
+    """
+    argument: str
+    evidence: list = field(default_factory=list)   # list[Evidence]
+    rebuttal: str = ""
+
+    @property
+    def source_urls(self) -> list[str]:
+        urls: list[str] = []
+        for item in self.evidence:
+            if item.source_url and item.source_url not in urls:
+                urls.append(item.source_url)
+        return urls
+
+    def to_dict(self) -> dict:
+        return {
+            "argument": self.argument,
+            "evidence": [e.to_dict() for e in self.evidence],
+            "rebuttal": self.rebuttal,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Counterargument":
+        return cls(
+            argument=str(data.get("argument", "")),
+            evidence=[Evidence.from_dict(item) for item in (data.get("evidence") or [])],
+            rebuttal=str(data.get("rebuttal", "")),
+        )
+
+
+@dataclass
+class CriticalAnalysis:
+    """
+    Structured critical analysis of a research question's evidence.
+
+    Kept as data (never prose-only) so a later synthesis phase can consume it:
+    major claims with their classifications and evidence, grounded
+    counterarguments, limitations, uncertainties, and open questions.
+    """
+    topic: str
+    research_question: str = ""
+    claims: list = field(default_factory=list)              # list[ClaimAnalysis]
+    counterarguments: list = field(default_factory=list)    # list[Counterargument]
+    limitations: list = field(default_factory=list)         # list[str]
+    uncertainties: list = field(default_factory=list)       # list[str]
+    unresolved_questions: list = field(default_factory=list)  # list[str]
+    status: str = "ok"                                      # ok | empty
+    created_at: Optional[datetime] = None
+
+    STATUS_OK = "ok"
+    STATUS_EMPTY = "empty"
+
+    def to_dict(self) -> dict:
+        return {
+            "topic": self.topic,
+            "research_question": self.research_question,
+            "claims": [c.to_dict() for c in self.claims],
+            "counterarguments": [c.to_dict() for c in self.counterarguments],
+            "limitations": list(self.limitations),
+            "uncertainties": list(self.uncertainties),
+            "unresolved_questions": list(self.unresolved_questions),
+            "status": self.status,
+            "created_at": _iso(self.created_at),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CriticalAnalysis":
+        return cls(
+            topic=str(data.get("topic", "")),
+            research_question=str(data.get("research_question", "")),
+            claims=[ClaimAnalysis.from_dict(item) for item in (data.get("claims") or [])],
+            counterarguments=[
+                Counterargument.from_dict(item) for item in (data.get("counterarguments") or [])
+            ],
+            limitations=list(data.get("limitations") or []),
+            uncertainties=list(data.get("uncertainties") or []),
+            unresolved_questions=list(data.get("unresolved_questions") or []),
+            status=str(data.get("status", cls.STATUS_OK)),
+            created_at=_parse_iso(data.get("created_at")),
+        )
+
+
+# ---------------------------------------------------------------------------
 # ResearchReport – Critical Analysis / Synthesize output
 # ---------------------------------------------------------------------------
 
@@ -422,5 +587,8 @@ __all__ = [
     "ResearchSource",
     "Evidence",
     "Claim",
+    "ClaimAnalysis",
+    "Counterargument",
+    "CriticalAnalysis",
     "ResearchReport",
 ]
