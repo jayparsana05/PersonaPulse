@@ -12,6 +12,7 @@ from src.agent import (
     run_critical_analysis,
     run_evidence,
     run_pipeline,
+    run_post,
     run_report,
     run_research,
     run_selection,
@@ -28,6 +29,7 @@ from src.models import (
     TopicCandidate,
     TopicSelection,
 )
+from src.post import draft_report_post
 from src.report import synthesize_report
 
 __all__ = [
@@ -37,7 +39,9 @@ __all__ = [
     "run_evidence",
     "run_critical_analysis",
     "run_report",
+    "run_post",
     "synthesize_report",
+    "draft_report_post",
     "TopicCandidate",
     "TopicSelection",
     "ResearchQuestion",

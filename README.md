@@ -39,6 +39,35 @@ GitHub Actions (Cron)
 
 ---
 
+## Research Agent (Phases 3–4)
+
+A multi-stage research DAG that runs before drafting, replacing the single-article
+ingestion for the primary flow:
+
+```
+Discover → Select Topic → Research Question → Multi-source Research
+  → Evidence → Critical Analysis → ResearchReport
+  → LinkedIn Draft (grounded in the report, not one article)
+  → Telegram Approval → Publish (LinkedIn + X)
+```
+
+Entry points (`python -m src.agent`):
+
+| Flag | Stage |
+|------|-------|
+| `--discover` | Phase-1 topic discovery |
+| `--research "q"` | Phase-2 multi-source research |
+| `--evidence "q"` | Evidence extraction -> claims |
+| `--analyze "q"` | Critical analysis (+ no drafting) |
+| `--report "q"` | ResearchReport synthesis (+ no drafting) |
+| `--post "q"` | Phase-4 LinkedIn draft from the report, then Telegram approval. **Never publishes** — like the graph path, it stops at a PENDING post awaiting approval. |
+
+Phase 4 modules: `src/evidence.py`, `src/analysis.py`, `src/report.py`,
+`src/post.py` (report-grounded drafting). Publishing still happens only through
+the Telegram approval edge function; `src/publishers.py` is unchanged.
+
+---
+
 ## Tech Stack
 
 | Component | Technology |

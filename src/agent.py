@@ -24,6 +24,7 @@ Entry Points
     python -m src.agent --evidence "question"    # Phase-3 evidence extraction (research → claims), no drafting
     python -m src.agent --analyze "question"     # Phase-3 critical analysis (research → evidence → analysis), no drafting
     python -m src.agent --report "question"      # Phase-3 report synthesis (research → evidence → analysis → report), no drafting
+    python -m src.agent --post "question"        # Phase-4 LinkedIn draft (research → ... → report → drafts → Telegram approval), no publishing
 """
 
 from __future__ import annotations
@@ -51,7 +52,8 @@ from src.memory import (
     store_research_question,
     store_research_sources,
 )
-from src.models import ResearchQuestion
+from src.models import ResearchQuestion, ResearchReport
+from src.post import draft_report_post
 from src.report import synthesize_report as report_stage
 from src.research import research_question as research_stage
 from src.selection import frame_question, select_topic
@@ -76,6 +78,9 @@ class AgentState(TypedDict, total=False):
 
     # Search
     article: dict                       # keys: url, title, body, published, source
+
+    # ResearchReport (Phase-4: LinkedIn drafting consumes the report)
+    report: dict                        # ResearchReport dict (topic, findings, ...)
 
     # Discovery (research-agent phase)
     topic_candidates: list              # list[TopicCandidate]
@@ -189,18 +194,30 @@ def _should_halt_after_dedup(state: AgentState) -> str:
 
 def node_draft(state: AgentState) -> AgentState:
     """
-    Retrieve the style profile and generate both LinkedIn and X drafts
-    using Gemini Flash 2.0.
+    Draft LinkedIn + X posts.
+
+    Primary path (Phase 4): a ResearchReport in the state drives the drafts via
+    the report-grounded drafting stage – the single article is no longer
+    required. Legacy path: falls back to the article-based drafter when no
+    report is present (old canary → search → dedup flow).
     """
     log.info("━━━ [Node 4/5] Drafting ━━━")
 
     style_profile = get_style_profile()
-    article       = state["article"]
 
-    linkedin_draft = draft_post(article, style_profile, platform="linkedin")
-    x_draft        = draft_post(article, style_profile, platform="x")
-
-    log.info("[Draft] LinkedIn: %d chars | X: %d chars", len(linkedin_draft), len(x_draft))
+    report = state.get("report")
+    if report is not None:
+        report_obj = report if isinstance(report, ResearchReport) else ResearchReport.from_dict(report)
+        result = draft_report_post(report_obj, style_profile=style_profile)
+        linkedin_draft = result["linkedin_draft"]
+        x_draft        = result["x_draft"]
+        log.info("[Draft] From ResearchReport | LinkedIn: %d chars | X: %d chars | status=%s",
+                 len(linkedin_draft), len(x_draft), result["status"])
+    else:
+        article       = state["article"]
+        linkedin_draft = draft_post(article, style_profile, platform="linkedin")
+        x_draft        = draft_post(article, style_profile, platform="x")
+        log.info("[Draft] From article | LinkedIn: %d chars | X: %d chars", len(linkedin_draft), len(x_draft))
 
     return {
         **state,
@@ -214,32 +231,58 @@ def node_draft(state: AgentState) -> AgentState:
 # Node 5: Store & Alert
 # ---------------------------------------------------------------------------
 
+def _article_view_for_report(report_obj) -> dict:
+    """A minimal article-shaped dict for the Telegram alert caption + storage."""
+    source = report_obj.sources[0] if report_obj.sources else None
+    return {
+        "source": (source.source if source else "") or "",
+        "title":  report_obj.topic or "Research brief",
+        "url":    (source.url if source else "") or "",
+    }
+
+
 def node_store_and_alert(state: AgentState) -> AgentState:
     """
-    1. Extract og:image from article URL.
+    1. Extract og:image from the source (article URL, or the report's first
+       source when drafting from a ResearchReport).
     2. Store the draft to Supabase (status=PENDING).
     3. Send Telegram photo/text message with approval inline keyboard.
+
+    The report-driven path replaces the single-article dependency: when the
+    drafts came from a ResearchReport, the report's topic + first source stand
+    in for the article metadata. Publishing is untouched: it happens only via
+    the Telegram approval flow.
     """
     log.info("━━━ [Node 5/5] Store & Alert ━━━")
 
-    article        = state["article"]
+    article_is_report = state.get("report") is not None
+    if article_is_report:
+        report_obj = state["report"]
+        report_obj = report_obj if isinstance(report_obj, ResearchReport) else ResearchReport.from_dict(report_obj)
+        article_ref = _article_view_for_report(report_obj)
+    else:
+        article_ref = state["article"]
+
     embedding      = state["embedding"]
     linkedin_draft = state["linkedin_draft"]
     x_draft        = state["x_draft"]
 
     # ── Extract og:image (best-effort) ─────────────────────────────────
-    # Returns both the og:image URL (for the posts table) and the raw
-    # image bytes (for the Telegram photo). Either may be None.
-    image_url, image_bytes = extract_og_image_with_url(article.get("url", ""))
+    image_url, image_bytes = extract_og_image_with_url(article_ref.get("url", ""))
 
     # ── Store in Supabase ───────────────────────────────────────────────
+    if embedding is None:
+        embedding = get_normalized_embedding(
+            f"{article_ref.get('title', '')} {linkedin_draft}"
+        )
+
     combined_content = f"LINKEDIN:\n{linkedin_draft}\n\nX:\n{x_draft}"
     post_id = store_draft(
         platform    = "both",
-        topic       = article["title"][:256],
+        topic       = article_ref.get("title", "Research brief")[:256],
         content     = combined_content,
         embedding   = embedding,
-        article_url = article.get("url"),
+        article_url = article_ref.get("url") or None,
         image_url   = image_url,
     )
 
@@ -250,7 +293,7 @@ def node_store_and_alert(state: AgentState) -> AgentState:
         post_id        = post_id,
         linkedin_draft = linkedin_draft,
         x_draft        = x_draft,
-        article        = article,
+        article        = article_ref,
         image_bytes    = image_bytes,
     )
 
@@ -772,6 +815,100 @@ def run_report(
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase-4 LinkedIn Draft / Approval Entry Point (Research Agent)
+# ---------------------------------------------------------------------------
+# ResearchReport → drafts → store PENDING → Telegram approval alert → stop.
+# The drafts are generated from the ResearchReport (not a single article).
+# Publishing is NOT performed here: it happens only via the existing Telegram
+# approval edge function after the author approves the PENDING post.
+
+def run_post(
+    report=None,
+    style_profile=None,
+    research_question_id: Optional[str] = None,
+    use_llm: bool = True,
+) -> dict:
+    """
+    Run the Phase-4 LinkedIn Draft stage for an existing ResearchReport.
+
+    Parameters
+    ----------
+    report          : ResearchReport (or its dict serialization) to draft from.
+    style_profile   : dict from get_style_profile(); fetched when not given.
+    research_question_id : str, optional
+        Traceability parity with the earlier stages; reserved for persistence.
+    use_llm         : bool – passed through to the drafting stage; False uses
+                      the deterministic fallback (no API call).
+
+    Returns
+    -------
+    dict with keys:
+        report         : the ResearchReport that was drafted from
+        linkedin_draft : str
+        x_draft        : str
+        used_findings  : list[str] finding claims restated by the post
+        grounded       : bool
+        issues         : list[str] grounding problems ("" when clean)
+        status         : "ok" | "fallback" | "empty"
+        post_id        : UUID of the PENDING post awaiting Telegram approval
+    """
+    logging.basicConfig(
+        level  = logging.INFO,
+        format = "%(asctime)s %(levelname)-8s │ %(message)s",
+        datefmt= "%H:%M:%S",
+    )
+
+    report_obj = report
+    if not isinstance(report_obj, ResearchReport):
+        report_obj = ResearchReport.from_dict(report) if isinstance(report, dict) else ResearchReport(topic="")
+
+    log.info(
+        "📝 Research Agent – LinkedIn Draft | topic='%s' | findings=%d",
+        report_obj.topic, len(report_obj.findings),
+    )
+
+    profile = style_profile if style_profile is not None else get_style_profile()
+    draft_result = draft_report_post(report_obj, style_profile=profile, use_llm=use_llm)
+
+    article_ref = _article_view_for_report(report_obj)
+    combined_content = (
+        f"LINKEDIN:\n{draft_result['linkedin_draft']}\n\nX:\n{draft_result['x_draft']}"
+    )
+
+    # ── og:image (best effort, existing mechanism) ─────────────────────
+    image_url, image_bytes = extract_og_image_with_url(article_ref.get("url", ""))
+
+    # ── Dedup embedding of the drafted content (existing mechanism) ────
+    embedding = get_normalized_embedding(f"{article_ref['title']} {report_obj.synthesis}")
+
+    # ── Store PENDING + send approval alert (existing mechanism) ───────
+    post_id = store_draft(
+        platform    = "both",
+        topic       = article_ref["title"][:256],
+        content     = combined_content,
+        embedding   = embedding,
+        article_url = article_ref.get("url") or None,
+        image_url   = image_url,
+    )
+    log.info("[Post] Draft stored – id=%s (status=PENDING)", post_id)
+
+    send_telegram_alert(
+        post_id        = post_id,
+        linkedin_draft = draft_result["linkedin_draft"],
+        x_draft        = draft_result["x_draft"],
+        article        = article_ref,
+        image_bytes    = image_bytes,
+    )
+    log.info("[Post] Telegram approval request sent – draft id=%s awaiting approval.", post_id)
+
+    return {
+        **draft_result,
+        "report": report_obj,
+        "post_id": post_id,
+    }
+
+
 if __name__ == "__main__":
     print("Starting PersonaPulse Pipeline...")
     args = sys.argv[1:]
@@ -852,6 +989,37 @@ if __name__ == "__main__":
             research["research_sources"],
             evidence_result["evidence"],
             analysis_result["analysis"],
+            research_question_id=question_id,
+        )
+        sys.exit(0)
+
+    if args and args[0] == "--post":
+        rq = ResearchQuestion(
+            topic=args[1] if len(args) > 1 else "",
+            question=args[1] if len(args) > 1 else "",
+            aspects=[],
+        )
+        question_id = persist_research_question(rq)
+        research = run_research(rq, research_question_id=question_id)
+        evidence_result = run_evidence(
+            research["research_question"],
+            research["research_sources"],
+            research_question_id=question_id,
+        )
+        analysis_result = run_critical_analysis(
+            evidence_result["research_question"],
+            evidence_result["evidence"],
+            research_question_id=question_id,
+        )
+        report_result = run_report(
+            research["research_question"],
+            research["research_sources"],
+            evidence_result["evidence"],
+            analysis_result["analysis"],
+            research_question_id=question_id,
+        )
+        result = run_post(
+            report_result["report"],
             research_question_id=question_id,
         )
         sys.exit(0)
