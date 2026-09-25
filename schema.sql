@@ -71,6 +71,14 @@ CREATE INDEX IF NOT EXISTS research_questions_embedding_idx
 -- `url` is stored normalized; callers add a per-session source
 -- cap before persistence. Access-history dedup across sessions is
 -- done at the application layer (see src.memory).
+--
+-- Each row belongs to exactly one session (no many-to-many link
+-- table). When a run discovers sources that are ALL already known
+-- from earlier sessions, src.memory.link_research_sources writes
+-- lightweight per-session *link rows* (url + title only, empty body)
+-- instead of duplicating the full source content; hydration then
+-- re-loads the full content from the newest stored record with the
+-- same normalized url, keeping the session reusable.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS research_sources (
     id                   UUID          PRIMARY KEY DEFAULT gen_random_uuid(),

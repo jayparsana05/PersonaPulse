@@ -22,7 +22,7 @@ import json
 import os
 import unittest
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 # Dummy env vars (see tests/test_ingestion_discovery.py) so src.config
 # imports cleanly in CI / without a populated .env.
@@ -525,15 +525,38 @@ class RunResearchSkipKnownSourcesTest(unittest.TestCase):
         with patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
              patch("src.research.search_news", return_value=results), \
              patch("src.agent.get_known_source_urls", return_value={"https://ex.com/known"}), \
-             patch("src.agent.store_research_sources", return_value=["id-2"]) as store:
+             patch("src.agent.store_research_sources", return_value=["id-2"]) as store, \
+             patch("src.agent.link_research_sources") as link:
             result = run_research(research_question_fixture(), research_question_id="qid-1", skip_known_sources=True)
 
         self.assertEqual(result["status"], "ok")
         # In-memory result keeps both sources (dedup is only about persistence).
         self.assertEqual(len(result["research_sources"]), 2)
-        # Only the fresh source reaches persistence.
+        # Only the fresh source reaches persistence (no linking needed).
         self.assertEqual(len(store.call_args.args[1]), 1)
         self.assertEqual(store.call_args.args[1][0].url, "https://ex.com/fresh")
+        link.assert_not_called()
+
+    def test_all_known_sources_are_linked_not_re_persisted(self):
+        results = [raw_result(url="https://ex.com/known", score=0.9)]
+        with patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+             patch("src.research.search_news", return_value=results), \
+             patch("src.agent.get_known_source_urls", return_value={"https://ex.com/known"}), \
+             patch("src.agent.store_research_sources") as store, \
+             patch("src.agent.link_research_sources", return_value=["lnk-1"]) as link:
+            result = run_research(research_question_fixture(), research_question_id="qid-1", skip_known_sources=True)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result["research_sources"]), 1)
+        # skip_known_sources is honored: the already-known source is NOT
+        # re-inserted as a duplicate full record.
+        store.assert_not_called()
+        # The session records lightweight per-session link rows instead.
+        link.assert_called_once()
+        self.assertEqual(link.call_args.args[0], "qid-1")
+        self.assertEqual(len(link.call_args.args[1]), 1)
+        self.assertEqual(link.call_args.args[1][0].url, "https://ex.com/known")
+        self.assertEqual(result["research_source_ids"], ["lnk-1"])
 
     def test_default_disables_cross_session_filter(self):
         results = [raw_result(url="https://ex.com/known", score=0.9)]
@@ -613,6 +636,19 @@ class MemorySim:
                 ids = [f"src-{len(session['source_ids']) + i}" for i in range(len(sources))]
                 session["sources"] = list(sources)
                 session["source_ids"] = ids
+                return ids
+        return []
+
+    def link_research_sources(self, research_question_id, sources):
+        """Mirror link_research_sources: record url/title-only link rows (no
+        duplicated full content), which is what hydration returns for the
+        now-reusable session."""
+        for session in self.sessions:
+            if session["id"] == research_question_id:
+                ids = [f"lnk-{len(session['source_ids']) + i}" for i in range(len(sources))]
+                links = [ResearchSource(url=s.url, title=s.title) for s in sources]
+                session["sources"].extend(links)
+                session["source_ids"].extend(ids)
                 return ids
         return []
 
@@ -849,6 +885,84 @@ class RunResearchOrReuseMemoryTest(unittest.TestCase):
         self.assertEqual(result["research_question_id"], "qid-old")
         self.assertEqual([s.url for s in result["research_sources"]], ["https://ex.com/old"])
         search.assert_not_called()
+
+    def _run_all_known(self, store_research_sources, link_research_sources, search_results):
+        """Run the fixture question once with ALL discovered sources marked
+        already-known (cross-session dedup would filter them all out). The
+        full-record store is expected to be mocked; the per-session link store
+        mirrors memory.link_research_sources."""
+        with patch.multiple(
+            "src.agent",
+            check_topic_researched=self.sim.check_topic_researched,
+            get_research_sources_for_question=self.sim.get_research_sources_for_question,
+            get_known_source_urls=lambda: {"https://ex.com/known"},
+            store_research_question=self.sim.store_research_question,
+            store_research_sources=store_research_sources,
+            link_research_sources=link_research_sources,
+            delete_research_question=self.sim.delete_research_question,
+        ), patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+            patch("src.research.search_news", side_effect=search_results) as search:
+            result = run_research_or_reuse(research_question_fixture())
+        return result, search
+
+    def test_all_sources_already_known_session_retained_and_reused(self):
+        """New question → valid research sources that are ALL already stored in
+        an earlier session: the session must survive (not be deleted because
+        cross-session dedup wrote no NEW rows), no duplicate source records may
+        be persisted, and the next identical run must reuse it without
+        triggering another Tavily search."""
+        store = Mock()
+        first, first_search = self._run_all_known(
+            store,
+            self.sim.link_research_sources,
+            [[raw_result(url="https://ex.com/known")]],
+        )
+
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual([s.url for s in first["research_sources"]], ["https://ex.com/known"])
+        qid = first["research_question_id"]
+        self.assertIsNotNone(qid)
+        # skip_known_sources=True is honored: the already-known source is NOT
+        # re-inserted as a full duplicate record (only lightweight link rows).
+        store.assert_not_called()
+        # Session retained (not deleted) even though every source was 'known'.
+        self.assertEqual(self.sim.session_ids(), [qid])
+        first_search.assert_called_once()
+
+        # Round 2: identical question → reuses the retained session, no search.
+        store2 = Mock()
+        second, second_search = self._run_all_known(
+            store2,
+            self.sim.link_research_sources,
+            [[raw_result(url="https://ex.com/should-not-be-fetched")]],
+        )
+        self.assertEqual(second["status"], "reused")
+        self.assertEqual(second["duplicate_reason"], "exact")
+        self.assertEqual(second["reused_question_id"], qid)
+        self.assertEqual(second["research_question_id"], qid)
+        self.assertEqual([s.url for s in second["research_sources"]], ["https://ex.com/known"])
+        store2.assert_not_called()
+        second_search.assert_not_called()
+
+    def test_all_sources_known_keeps_session_when_linking_writes_no_rows(self):
+        """Even when the link persistence is unavailable (returns no row ids /
+        raises), a run that discovered valid sources is retained: an empty
+        'research_source_ids' alone must not trigger session cleanup."""
+        def _link_failure(question_id, sources):
+            raise RuntimeError("store unavailable")
+
+        result, search = self._run_all_known(
+            Mock(),
+            _link_failure,
+            [[raw_result(url="https://ex.com/known")]],
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["research_source_ids"], [])
+        self.assertEqual(len(result["research_sources"]), 1)
+        self.assertIsNotNone(result["research_question_id"])
+        # The newly created session is still there (not deleted).
+        self.assertEqual(len(self.sim.sessions), 1)
+        search.assert_called_once()
 
 
 if __name__ == "__main__":

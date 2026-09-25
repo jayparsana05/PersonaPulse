@@ -41,6 +41,7 @@ from src.memory import (  # noqa: E402
     get_known_research_questions,
     get_known_source_urls,
     get_research_sources_for_question,
+    link_research_sources,
     store_draft,
     store_research_question,
     store_research_sources,
@@ -243,6 +244,59 @@ class StoreResearchSourcesTest(unittest.TestCase):
         self.assertTrue(all(i == FakeResult.data[0]["id"] for i in ids))
 
 
+class LinkResearchSourcesTest(unittest.TestCase):
+    """link_research_sources writes lightweight per-session link rows (url +
+    title only, no duplicated full content) for already-known sources."""
+
+    def setUp(self):
+        self.fake_client = FakeSupabase()
+
+    def _source(self):
+        return ResearchSource(
+            url="https://ex.com/known",
+            title="Known source",
+            body="A body snippet.",
+            source="ex.com",
+            published="2026-09-19",
+            score=0.9,
+        )
+
+    def _link(self, sources=None, question_id="qid-1"):
+        with patch("src.memory._get_supabase", return_value=self.fake_client):
+            return link_research_sources(
+                question_id, sources if sources is not None else [self._source()]
+            )
+
+    def test_inserts_into_research_sources_table(self):
+        self._link()
+        self.assertEqual(self.fake_client.table_name, "research_sources")
+
+    def test_link_rows_record_url_and_title_only(self):
+        self._link()
+        row = self.fake_client.rows[0]
+        self.assertEqual(row["url"], "https://ex.com/known")
+        self.assertEqual(row["title"], "Known source")
+        # No duplicated full content: body / source / published are omitted.
+        self.assertNotIn("body", row)
+        self.assertNotIn("source", row)
+        self.assertNotIn("published", row)
+        self.assertIsNotNone(row["accessed_at"])
+
+    def test_link_rows_are_scoped_to_the_session(self):
+        self._link(question_id="qid-7")
+        self.assertEqual(self.fake_client.rows[0]["research_question_id"], "qid-7")
+
+    def test_returns_one_id_per_link_row(self):
+        ids = self._link([self._source(), self._source()])
+        self.assertEqual(len(self.fake_client.rows), 2)
+        self.assertEqual(len(ids), 2)
+        self.assertTrue(all(i == FakeResult.data[0]["id"] for i in ids))
+
+    def test_question_id_none_when_unknown(self):
+        self._link(question_id=None)
+        self.assertIsNone(self.fake_client.rows[0]["research_question_id"])
+
+
 class FakeResultWithData:
     def __init__(self, data):
         self.data = data
@@ -274,6 +328,10 @@ class FakeSelectableSupabase:
 
     def eq(self, col, val):
         self.calls.append(("eq", col, val))
+        return self
+
+    def in_(self, col, values):
+        self.calls.append(("in_", col, values))
         return self
 
     def execute(self):
@@ -452,6 +510,122 @@ class GetResearchSourcesForQuestionTest(unittest.TestCase):
         with patch("src.memory._get_supabase", side_effect=RuntimeError("db down")):
             sources, ids = get_research_sources_for_question("qid-1")
         self.assertEqual((sources, ids), ([], []))
+
+    def test_full_rows_do_not_trigger_enrichment_lookup(self):
+        row = {
+            "id": "src-1",
+            "url": "https://ex.com/a",
+            "title": "Source A",
+            "body": "Body.",
+            "source": "ex.com",
+            "published": "2026-09-19",
+            "score": 0.9,
+            "source_type": "secondary",
+            "accessed_at": "2026-09-19T10:00:00+00:00",
+        }
+        fake = FakeSelectableSupabase([row])
+        with patch("src.memory._get_supabase", return_value=fake):
+            sources, ids = get_research_sources_for_question("qid-1")
+        self.assertEqual(ids, ["src-1"])
+        self.assertEqual(sources[0].body, "Body.")
+        self.assertNotIn("in_", [c[0] for c in fake.calls])
+
+    def test_link_rows_are_enriched_with_existing_full_records(self):
+        """Per-session link rows (url + empty body) are hydrated with the full
+        content already stored for the same URL in an earlier session."""
+        link_row = {
+            "id": "lnk-1",
+            "url": "https://ex.com/known",
+            "title": "Known",
+            "body": "",
+            "source": "",
+            "published": "",
+            "score": 0.0,
+            "source_type": "secondary",
+            "accessed_at": "2026-09-20T10:00:00+00:00",
+        }
+        canonical = {
+            "id": "src-0",
+            "url": "https://ex.com/known",
+            "title": "Known source",
+            "body": "A snippet about orchestration.",
+            "source": "ex.com",
+            "published": "2026-09-19",
+            "score": 0.9,
+            "source_type": "secondary",
+            "accessed_at": "2026-09-19T10:00:00+00:00",
+        }
+
+        class TwoStage(FakeSelectableSupabase):
+            def __init__(self):
+                super().__init__([link_row])
+                self._reads = 0
+
+            def execute(self):
+                self._reads += 1
+                return FakeResultWithData([canonical] if self._reads > 1 else self._result_rows)
+
+        fake = TwoStage()
+        with patch("src.memory._get_supabase", return_value=fake):
+            sources, ids = get_research_sources_for_question("qid-1")
+        # The session's link-row id is kept; content comes from the existing record.
+        self.assertEqual(ids, ["lnk-1"])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].url, "https://ex.com/known")
+        self.assertEqual(sources[0].title, "Known source")
+        self.assertEqual(sources[0].body, "A snippet about orchestration.")
+        self.assertEqual(sources[0].score, 0.9)
+
+    def test_newer_link_row_does_not_override_full_source_content(self):
+        """A lightweight link row written AFTER the original full source (same
+        URL) is never chosen as the canonical record: hydration must return the
+        full source content, not the younger, content-less link row."""
+        session_link = {
+            "id": "lnk-2",
+            "url": "https://ex.com/known",
+            "title": "Known",
+            "body": "",
+            "source": "",
+            "published": "",
+            "score": 0.0,
+            "source_type": "secondary",
+            "accessed_at": "2026-09-21T10:00:00+00:00",
+        }
+        full_source = {
+            "id": "src-0",
+            "url": "https://ex.com/known",
+            "title": "Known source",
+            "body": "A snippet about orchestration.",
+            "source": "ex.com",
+            "published": "2026-09-19",
+            "score": 0.9,
+            "source_type": "secondary",
+            "accessed_at": "2026-09-19T10:00:00+00:00",
+        }
+        # The cross-session lookup returns rows newest-first: the session's own
+        # link row (latest accessed_at) BEFORE the older full record.
+        candidates = [session_link, full_source]
+
+        class TwoStage(FakeSelectableSupabase):
+            def __init__(self):
+                super().__init__([session_link])
+                self._reads = 0
+
+            def execute(self):
+                self._reads += 1
+                return FakeResultWithData(candidates if self._reads > 1 else self._result_rows)
+
+        fake = TwoStage()
+        with patch("src.memory._get_supabase", return_value=fake):
+            sources, ids = get_research_sources_for_question("qid-1")
+        self.assertEqual(ids, ["lnk-2"])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].url, "https://ex.com/known")
+        self.assertEqual(sources[0].title, "Known source")
+        self.assertEqual(sources[0].body, "A snippet about orchestration.")
+        self.assertEqual(sources[0].source, "ex.com")
+        self.assertEqual(sources[0].published, "2026-09-19")
+        self.assertEqual(sources[0].score, 0.9)
 
 
 class GetKnownSourceUrlsTest(unittest.TestCase):

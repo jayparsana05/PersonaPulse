@@ -284,6 +284,48 @@ def store_research_sources(
     return source_ids
 
 
+def link_research_sources(
+    research_question_id: Optional[str],
+    sources: list[ResearchSource],
+) -> list[str]:
+    """
+    Persist lightweight per-session *link rows* for already-known sources.
+
+    When ``skip_known_sources`` filters EVERY discovered source out of
+    :func:`store_research_sources` (all of them already stored in earlier
+    sessions), a brand-new session would otherwise own no source rows at all
+    and could never be reused. ``research_sources`` links each row to exactly
+    one research question (no many-to-many / sharing table), so re-inserting
+    the known sources would create duplicate full records. Instead this
+    records, per session, a row carrying only ``url`` (+ ``title``) — a
+    reference back to the existing full record.
+
+    Hydration (:func:`get_research_sources_for_question`) recognises these
+    link rows (empty ``body``) and re-loads the full content from the newest
+    stored record with the same normalized URL, so a reused session returns
+    fully usable sources without either re-running Tavily or duplicating
+    source content. Returns the generated UUIDs of the link rows.
+    """
+    supabase = _get_supabase()
+    link_ids: list[str] = []
+
+    for source in sources:
+        accessed_at = source.accessed_at or datetime.now(timezone.utc)
+        row = {
+            "research_question_id": research_question_id,
+            "url": source.url,
+            "title": source.title,
+            "score": source.score,
+            "source_type": source.source_type,
+            "accessed_at": accessed_at.isoformat(),
+        }
+        result = supabase.table("research_sources").insert(row).execute()
+        link_ids.append(result.data[0]["id"])
+
+    log.info("[Memory] Linked %d known source(s) to question_id=%s", len(link_ids), research_question_id)
+    return link_ids
+
+
 # ---------------------------------------------------------------------------
 # Research-session memory (remember researched topics/questions)
 # ---------------------------------------------------------------------------
@@ -464,6 +506,52 @@ def check_topic_researched(
     return result
 
 
+def _load_latest_sources_by_url(urls: list[str]) -> dict[str, ResearchSource]:
+    """Newest full-source row per normalized URL, across all sessions.
+
+    Used to enrich per-session *link rows* (see :func:`link_research_sources`)
+    with the full content that the original (earlier) session stored for the
+    same normalized URL. Only rows with usable source content qualify as the
+    canonical source — lightweight link rows (``body=''``), even when they are
+    NEWER than the full record, are never selected as the canonical source.
+    Non-blocking: an unavailable store returns {}.
+    """
+    urls = [u for u in urls if (u or "").strip()]
+    if not urls:
+        return {}
+
+    try:
+        supabase = _get_supabase()
+        result = (
+            supabase.table("research_sources")
+            .select("id", "url", "title", "body", "source", "published",
+                    "score", "source_type", "accessed_at")
+            .in_("url", urls)
+            .order("accessed_at", desc=True)
+            .execute()
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(
+            "[Memory] Could not load existing source records for enrichment (%s: %s).",
+            type(exc).__name__, exc,
+        )
+        return {}
+
+    latest: dict[str, ResearchSource] = {}
+    for row in list(result.data or []):
+        body = (row.get("body") or "").strip()
+        if not body:
+            # Lightweight link rows carry no source content and must never be
+            # treated as the canonical record, even if they were written later.
+            continue
+        url = (row.get("url") or "").strip()
+        key = (_normalize_url(url) or url).casefold()
+        if not key or key in latest:
+            continue
+        latest[key] = ResearchSource.from_dict(dict(row))
+    return latest
+
+
 def get_research_sources_for_question(
     research_question_id: Optional[str],
 ) -> tuple[list[ResearchSource], list[str]]:
@@ -472,7 +560,12 @@ def get_research_sources_for_question(
 
     Used to *reuse* a remembered session: when a topic/question was already
     researched, the stored sources come back without re-searching them.
-    Non-blocking: on store failure or unknown id, returns empty lists.
+    Per-session *link rows* (recorded by :func:`link_research_sources` when a
+    run discovered only already-known sources) are enriched in place with the
+    full content of the existing stored record for the same normalized URL,
+    so a successful session always hydrates usable sources without duplicating
+    source content. Non-blocking: on store failure or unknown id, returns
+    empty lists.
     """
     if not research_question_id:
         return [], []
@@ -494,6 +587,24 @@ def get_research_sources_for_question(
             row_id = row.pop("id", None)
             sources.append(ResearchSource.from_dict(row))
             ids.append(row_id)
+
+        # Enrich link rows (empty body) with the full content already stored
+        # for the same URL in an earlier session.
+        link_urls = [s.url for s in sources if not (s.body or "").strip()]
+        if link_urls:
+            latest = _load_latest_sources_by_url(link_urls)
+            if latest:
+                enriched: list[ResearchSource] = []
+                for source in sources:
+                    key = (_normalize_url(source.url) or source.url).casefold()
+                    full = latest.get(key)
+                    if not (source.body or "").strip() and full is not None:
+                        enriched.append(full)
+                    else:
+                        enriched.append(source)
+                sources = enriched
+                sources.sort(key=lambda s: s.score, reverse=True)
+
         return sources, ids
     except Exception as exc:  # pylint: disable=broad-except
         log.warning(

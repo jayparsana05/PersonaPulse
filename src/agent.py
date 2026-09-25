@@ -25,6 +25,10 @@ Entry Points
     python -m src.agent --analyze "question"     # Phase-3 critical analysis (research → evidence → analysis), no drafting
     python -m src.agent --report "question"      # Phase-3 report synthesis (research → evidence → analysis → report), no drafting
     python -m src.agent --post "question"        # Phase-4 LinkedIn draft (research → ... → report → drafts → Telegram approval), no publishing
+    python -m src.agent --run "query"            # End-to-end research agent
+                                                 # (discovery → selection → research → evidence → analysis → report
+                                                 #  → drafts → Telegram approval), stops at PENDING; publication
+                                                 # happens later via the Telegram edge function after human approval.
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ from src.memory import (
     get_normalized_embedding,
     get_research_sources_for_question,
     get_style_profile,
+    link_research_sources,
     store_draft,
     store_research_question,
     store_research_sources,
@@ -642,7 +647,14 @@ def run_research(
         When True, sources whose normalized URL was already recorded in an
         earlier research session are kept in the in-memory result but skipped
         on persistence (the existing per-run _dedupe_sources is unchanged).
-        Non-blocking: memory failures degrade to persisting everything.
+        If that filter would leave NOTHING to persist while the run still
+        discovered usable sources (all already known), NO duplicate full
+        records are re-inserted: the session stays retained and only
+        lightweight per-session *link rows* are recorded (see
+        ``memory.link_research_sources``), so hydration re-loads the sources
+        from the existing records and the session stays reusable. Non-blocking:
+        memory failures degrade to persisting everything / leaving the session
+        unlinked.
 
     Returns
     -------
@@ -650,8 +662,9 @@ def run_research(
         research_question    : the ResearchQuestion researched
         research_sources     : list[ResearchSource] (normalized + deduplicated)
         status               : "ok" when ≥1 source, else "empty"
-        research_source_ids  : list[str] of persisted row UUIDs (may be empty
-                               when nothing was persisted or persistence failed)
+        research_source_ids  : list[str] of persisted row UUIDs (full rows or
+                               link rows; may be empty when nothing was
+                               persisted or persistence failed)
     """
     logging.basicConfig(
         level  = logging.INFO,
@@ -688,13 +701,39 @@ def run_research(
                     "📚 Skipped persisting %d source(s) already stored in earlier sessions.",
                     len(repeated),
                 )
-        if to_store and research_question_id:
-            try:
-                source_ids = store_research_sources(research_question_id, to_store)
-            except Exception as exc:  # pylint: disable=broad-except
+        # Cross-session dedup may have filtered EVERY discovered source out
+        # (all already known). That is not a failure: the run still discovered
+        # valid sources and the fresh session must stay retained so a later
+        # identical question reuses it instead of triggering Tavily again. We
+        # must NOT re-insert duplicates of those already-known sources; their
+        # per-session *link rows* are enough to keep the session hydratable.
+        if research_question_id:
+            if to_store:
+                try:
+                    source_ids = store_research_sources(research_question_id, to_store)
+                except Exception as exc:  # pylint: disable=broad-except
+                    log.warning(
+                        "⚠️  Could not persist research sources (%s: %s) – continuing with in-memory result.",
+                        type(exc).__name__, exc,
+                    )
+            elif sources and skip_known_sources:
+                try:
+                    source_ids = link_research_sources(research_question_id, sources)
+                except Exception as exc:  # pylint: disable=broad-except
+                    log.warning(
+                        "⚠️  Could not link known research sources to session %s (%s: %s) – staying unlinked.",
+                        research_question_id, type(exc).__name__, exc,
+                    )
+                else:
+                    log.info(
+                        "♻️  All %d discovered source(s) already stored in earlier sessions – "
+                        "recorded %d link row(s) for session %s (no source content duplicated).",
+                        len(sources), len(source_ids), research_question_id,
+                    )
+            else:
                 log.warning(
-                    "⚠️  Could not persist research sources (%s: %s) – continuing with in-memory result.",
-                    type(exc).__name__, exc,
+                    "🧭 Nothing to persist for session %s (%d source(s) kept in memory).",
+                    research_question_id, len(sources),
                 )
         else:
             log.warning(
@@ -752,10 +791,14 @@ def run_research_or_reuse(
 
     When *research_question_id* is None and a brand-new question proceeds to
     research, the new question row is persisted first so the collected sources
-    stay traceable (same mechanism the CLI entry points already used). If that
-    run produces nothing persistable (failure / no sources / persistence
-    produced no rows), the freshly created session is discarded so a failed
-    or incomplete run is never remembered as a reusable duplicate.
+    stay traceable (same mechanism the CLI entry points already used). The
+    freshly created session is discarded ONLY when the run produced no usable
+    research sources at all (failure / empty results); a run that discovered
+    valid sources is retained even when persistence recorded no NEW full rows
+    (e.g. every source was already stored in an earlier session — in which
+    case lightweight per-session link rows are recorded instead, and
+    hydration re-loads the source content from the existing records), so a
+    successful session is always reusable later.
 
     Returns
     -------
@@ -831,10 +874,13 @@ def run_research_or_reuse(
     result["duplicate_reason"] = None
     result["research_question_id"] = research_question_id
 
-    # A brand-new session that yielded nothing persistable must not linger as
-    # a remembered (but empty) session: the next run for the same question
-    # would otherwise hint a reuse and then fall back to research anyway.
-    usable = bool(result.get("research_sources")) and bool(result.get("research_source_ids"))
+    # A brand-new session that yielded NO usable research sources must not
+    # linger as a remembered (but empty) session: the next run for the same
+    # question would otherwise hint a reuse and then fall back to research
+    # anyway. Successful research is always kept – even when "research_source_ids"
+    # is empty because every discovered source was already stored in an earlier
+    # session (cross-session dedup) or the source rows could not be persisted.
+    usable = bool(result.get("research_sources"))
     if created_id is not None and not usable:
         log.warning(
             "🧽 Research produced nothing persistable for new session %s – discarding it (not remembered).",
@@ -1076,8 +1122,12 @@ def run_post(
         used_findings  : list[str] finding claims restated by the post
         grounded       : bool
         issues         : list[str] grounding problems ("" when clean)
-        status         : "ok" | "fallback" | "empty"
+        status         : "ok" | "fallback" | "empty" | "approval_alert_failed"
         post_id        : UUID of the PENDING post awaiting Telegram approval
+        approval_error : str – set only when status=="approval_alert_failed":
+                         the draft was stored (post_id remains usable) but the
+                         Telegram approval alert could not be delivered. The
+                         PENDING draft is deliberately kept for recovery.
     """
     logging.basicConfig(
         level  = logging.INFO,
@@ -1119,21 +1169,315 @@ def run_post(
     )
     log.info("[Post] Draft stored – id=%s (status=PENDING)", post_id)
 
-    send_telegram_alert(
-        post_id        = post_id,
-        linkedin_draft = draft_result["linkedin_draft"],
-        x_draft        = draft_result["x_draft"],
-        article        = article_ref,
-        research       = _research_summary_for_report(report_obj),
-        image_bytes    = image_bytes,
-    )
-    log.info("[Post] Telegram approval request sent – draft id=%s awaiting approval.", post_id)
+    approval_error: Optional[str] = None
+    status = draft_result.get("status", "ok")
+    try:
+        send_telegram_alert(
+            post_id        = post_id,
+            linkedin_draft = draft_result["linkedin_draft"],
+            x_draft        = draft_result["x_draft"],
+            article        = article_ref,
+            research       = _research_summary_for_report(report_obj),
+            image_bytes    = image_bytes,
+        )
+        log.info("[Post] Telegram approval request sent – draft id=%s awaiting approval.", post_id)
+    except Exception as exc:  # pylint: disable=broad-except
+        approval_error = f"{type(exc).__name__}: {exc}"
+        status = "approval_alert_failed"
+        log.warning(
+            "[Post] Telegram approval alert failed (%s) – draft %s kept as PENDING for recovery.",
+            approval_error, post_id,
+        )
 
     return {
         **draft_result,
+        "status": status,
         "report": report_obj,
         "post_id": post_id,
+        "approval_error": approval_error,
     }
+
+
+def run_research_agent(
+    query: str = "",
+    candidates: Optional[list] = None,
+    limit: Optional[int] = None,
+    use_llm: bool = True,
+    check_researched: bool = True,
+    reuse_researched: bool = True,
+    skip_known_sources: bool = True,
+    max_queries: Optional[int] = None,
+    max_sources_per_query: Optional[int] = None,
+    max_sources: Optional[int] = None,
+    min_score: Optional[float] = None,
+    max_claims_per_source: Optional[int] = None,
+) -> dict:
+    """Run the full end-to-end AI Engineering Research Agent.
+
+    This is a thin composition of the already-tested stage entry points
+    (run_discovery / run_selection / run_research_or_reuse / run_evidence /
+    run_critical_analysis / run_report / run_post) wrapped with the 13-step
+    workflow gating:
+
+    1. discover multiple engineering topics            → run_discovery (or injected candidates)
+    2. create TopicCandidates                          → run_discovery
+    3. select a topic                                  → run_selection
+    4. create a ResearchQuestion                       → run_selection (persisted for dedup)
+    5. discover multiple ResearchSources               → run_research_or_reuse (memory-aware)
+    6. extract Evidence / Claims                       → run_evidence
+    7. CriticalAnalysis                                → run_critical_analysis
+    8. ResearchReport                                  → run_report
+    9. LinkedIn draft (+ X)                            → run_post
+    10. send research summary + draft to Telegram      → run_post (send_telegram_alert)
+    11. wait for existing approval                      → handled by the Telegram edge function (external)
+    12. publish to LinkedIn AFTER approval              → handled by the Telegram edge function (external)
+    13. persist research history for future dedup       → selection persists the question; research persists sources
+
+    The agent never publishes directly: it always stops after storing a
+    PENDING draft and alerting Telegram (step 10). Publication (step 12) is
+    the responsibility of the existing supabase/functions/telegram-webhook
+    edge function after a human approves.
+
+    Gating / failure isolation
+    --------------------------
+    * Each stage yields a structured result; if a downstream stage receives
+      nothing usable, execution halts with a ``halt_reason`` and a final
+      ``status`` naming the empty stage (never a crash).
+    * Failures inside one research source are absorbed by the stage layers
+      (per-source/per-query try/except) and never terminate the session.
+    * If research produces nothing persistable **and** this run created the
+      session row, the empty row is best-effort deleted so future runs do not
+      treat a dead question as researched.
+
+    Parameters
+    ----------
+    query          : str – discovery search query (ignored when ``candidates`` given).
+    candidates     : optional pre-built TopicCandidate list to skip discovery.
+    limit          : discovery candidate limit override.
+    use_llm        : pass-through to the research/evidence/analysis/report/post stages.
+    check_researched/reuse_researched/skip_known_sources : memory-axis flags.
+    max_queries / max_sources_per_query / max_sources / min_score : research stage controls.
+    max_claims_per_source : evidence stage control.
+
+    Returns
+    -------
+    dict with keys:
+        status             : "posted" | "approval_alert_failed"
+                             | "discovery_empty" | "selection_empty"
+                             | "research_empty" | "evidence_empty"
+                             | "analysis_empty" | "report_empty" | "post_empty"
+        query, stages      : per-stage status map ("ok" | "empty" | "reused" | "fallback")
+        topic_candidates   : list[TopicCandidate]
+        selection          : TopicSelection | None
+        research_question  : ResearchQuestion | None
+        research_question_id / reused_question_id / duplicate_reason
+        research_sources   : list[ResearchSource]
+        research_source_ids: list[str]
+        evidence           : list[Evidence]
+        analysis           : CriticalAnalysis | None
+        report             : ResearchReport | None
+        post               : run_post() result dict | None
+        post_id            : PENDING draft id, when "posted"
+        halt_reason        : str when halted
+    """
+    logging.basicConfig(
+        level  = logging.INFO,
+        format = "%(asctime)s %(levelname)-8s │ %(message)s",
+        datefmt= "%H:%M:%S",
+    )
+    log = logging.getLogger(__name__)
+
+    stages: dict[str, str] = {}
+    result: dict = {
+        "status": "started",
+        "query": query,
+        "stages": stages,
+        "topic_candidates": [],
+        "selection": None,
+        "research_question": None,
+        "research_question_id": None,
+        "already_researched": False,
+        "reused_question_id": None,
+        "duplicate_reason": None,
+        "research_sources": [],
+        "research_source_ids": [],
+        "evidence": [],
+        "analysis": None,
+        "report": None,
+        "post": None,
+        "post_id": None,
+        "halt_reason": None,
+    }
+
+    def _halt(status: str, reason: str) -> dict:
+        result["status"] = status
+        result["halt_reason"] = reason
+        return result
+
+    # ── 1–2. Discovery → TopicCandidates ────────────────────────────────
+    if candidates is not None:
+        discovered = list(candidates)
+    else:
+        try:
+            discovered = run_discovery(query=query, limit=limit)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.warning("[Agent] Discovery failed (%s: %s) – halting.", type(exc).__name__, exc)
+            discovered = []
+    result["topic_candidates"] = discovered
+    stages["discovery"] = "ok" if discovered else "empty"
+    if not discovered:
+        log.warning("[Agent] No topic candidates – aborting (status=discovery_empty).")
+        return _halt("discovery_empty", "Discovery surfaced no topic candidates.")
+
+    # ── 3–4. Selection → ResearchQuestion (memory-aware persistence) ─────
+    selection_result = run_selection(
+        query=query,
+        limit=limit,
+        candidates=discovered,
+        check_researched=check_researched,
+    )
+    rq = selection_result["research_question"]
+    result["selection"] = selection_result["selection"]
+    result["research_question"] = rq
+    result["research_question_id"] = selection_result.get("research_question_id")
+    result["already_researched"] = bool(selection_result.get("already_researched"))
+    stages["selection"] = "ok" if rq is not None else "empty"
+    if rq is None:
+        log.warning("[Agent] No research question framed – aborting (status=selection_empty).")
+        return _halt("selection_empty", "No topic was selected / no research question was framed.")
+
+    # ── 5. Multi-source Research (memory-aware, failure-tolerant) ────────
+    try:
+        research = run_research_or_reuse(
+            rq,
+            research_question_id=result["research_question_id"],
+            use_llm=use_llm,
+            reuse_researched=reuse_researched,
+            skip_known_sources=skip_known_sources,
+            max_queries=max_queries,
+            max_sources_per_query=max_sources_per_query,
+            max_sources=max_sources,
+            min_score=min_score,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning("[Agent] Research stage failed (%s: %s) – treating as empty.",
+                    type(exc).__name__, exc)
+        research = {
+            "status": "empty",
+            "research_sources": [],
+            "research_source_ids": [],
+            "research_question_id": result["research_question_id"],
+            "reused_question_id": None,
+            "duplicate_reason": None,
+        }
+
+    sources = research["research_sources"]
+    result["research_sources"] = sources
+    result["research_source_ids"] = research["research_source_ids"]
+    result["research_question_id"] = research.get("research_question_id", result["research_question_id"])
+    result["reused_question_id"] = research.get("reused_question_id")
+    result["duplicate_reason"] = research.get("duplicate_reason")
+    stages["research"] = research.get("status", "empty")
+
+    if not sources:
+        log.warning("[Agent] Research returned no usable sources (status=research_empty).")
+        if not result["already_researched"] and result["research_question_id"]:
+            try:
+                delete_research_question(result["research_question_id"])
+                log.info("[Agent] Cleaned up empty research session %s.",
+                         result["research_question_id"])
+            except Exception as exc:  # pylint: disable=broad-except
+                log.warning("[Agent] Cleanup of empty research session failed (%s: %s).",
+                            type(exc).__name__, exc)
+            result["research_question_id"] = None
+        return _halt("research_empty", "Research returned no usable sources.")
+
+    # ── 6. Evidence / Claims ─────────────────────────────────────────────
+    evidence_result = run_evidence(
+        rq,
+        sources,
+        research_question_id=result["research_question_id"],
+        use_llm=use_llm,
+        max_claims_per_source=max_claims_per_source,
+    )
+    result["evidence"] = evidence_result["evidence"]
+    stages["evidence"] = evidence_result["status"]
+    if not evidence_result["evidence"]:
+        log.warning("[Agent] No supported claims extracted (status=evidence_empty).")
+        return _halt("evidence_empty", "No supported claims were extracted from the research sources.")
+
+    # ── 7. Critical Analysis ─────────────────────────────────────────────
+    analysis_result = run_critical_analysis(
+        rq,
+        result["evidence"],
+        research_question_id=result["research_question_id"],
+        use_llm=use_llm,
+    )
+    result["analysis"] = analysis_result["analysis"]
+    stages["analysis"] = analysis_result["status"]
+    if analysis_result["status"] != "ok":
+        log.warning("[Agent] Critical analysis produced nothing usable (status=analysis_empty).")
+        return _halt("analysis_empty", "Critical analysis produced no usable content.")
+
+    # ── 8. Research Report ───────────────────────────────────────────────
+    report_result = run_report(
+        rq,
+        sources,
+        result["evidence"],
+        result["analysis"],
+        research_question_id=result["research_question_id"],
+        use_llm=use_llm,
+    )
+    result["report"] = report_result["report"]
+    stages["report"] = report_result["status"]
+    if report_result["status"] != "ok":
+        log.warning("[Agent] Report synthesis produced nothing usable (status=report_empty).")
+        return _halt("report_empty", "Report synthesis produced no usable content.")
+
+    # ── 9–10. LinkedIn/X drafts → PENDING storage → Telegram approval ────
+    try:
+        post = run_post(
+            result["report"],
+            research_question_id=result["research_question_id"],
+            use_llm=use_llm,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning("[Agent] Post/Draft stage failed (%s: %s) – halting.",
+                    type(exc).__name__, exc)
+        post = {
+            "status": "empty",
+            "post_id": None,
+            "grounded": False,
+            "issues": [f"{type(exc).__name__}: {exc}"],
+        }
+    result["post"] = post
+    result["post_id"] = post.get("post_id")
+    stages["post"] = post.get("status", "empty")
+    if not post.get("post_id"):
+        log.warning("[Agent] Draft could not be stored/altered (status=post_empty).")
+        return _halt("post_empty", "The draft could not be stored or sent for approval.")
+
+    if post.get("status") == "approval_alert_failed":
+        result["status"] = "approval_alert_failed"
+        result["halt_reason"] = (
+            f"Draft {post['post_id']} stored as PENDING, but the Telegram approval "
+            f"alert failed: {post.get('approval_error') or 'unknown error'}. "
+            f"The PENDING draft is kept for recovery; nothing was published."
+        )
+        log.warning(
+            "[Agent] Draft %s stored as PENDING, but the Telegram approval alert "
+            "failed (status=approval_alert_failed). Nothing published.",
+            post["post_id"],
+        )
+        return result
+
+    log.info(
+        "✅ Research Agent complete – draft %s stored, awaiting Telegram approval "
+        "(status=posted). Investigated %d source(s), %d finding(s).",
+        post["post_id"], len(sources), len(result["report"].findings) if result["report"] else 0,
+    )
+    result["status"] = "posted"
+    return result
 
 
 if __name__ == "__main__":
@@ -1249,6 +1593,12 @@ if __name__ == "__main__":
             research_question_id=question_id,
         )
         sys.exit(0)
+
+    if args and args[0] == "--run":
+        result = run_research_agent(
+            query=args[1] if len(args) > 1 else "",
+        )
+        sys.exit(0 if result.get("status") == "posted" else 1)
 
     query_arg = args[0] if args else ""
     final_state = run_pipeline(query=query_arg)
