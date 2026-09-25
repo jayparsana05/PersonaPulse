@@ -187,6 +187,10 @@ def store_draft(
     """
     Insert a new PENDING draft into the `posts` table.
     Returns the generated UUID of the new row.
+
+    Per-platform status columns (linkedin_status / x_status) start as PENDING
+    alongside the top-level `status` so publication can be tracked and retired
+    per platform (see the Telegram approval edge function).
     """
     supabase = _get_supabase()
 
@@ -200,6 +204,8 @@ def store_draft(
         "image_url": image_url,
         "embedding": vector_literal,
         "status": "PENDING",
+        "linkedin_status": "PENDING",
+        "x_status": "PENDING",
     }
 
     result = supabase.table("posts").insert(row).execute()
@@ -407,6 +413,10 @@ def check_topic_researched(
        trip the memory while unrelated/follow-up questions stay below the
        threshold.
 
+    Dead sessions (status ``dropped``) are skipped in both passes, so a
+    discarded/incomplete session never suppresses later research on the same
+    question.
+
     Non-blocking: embedding or store failures degrade to "not matched"
     (research proceeds) rather than halting the pipeline.
 
@@ -449,8 +459,16 @@ def check_topic_researched(
     norm_topic = _normalize_research_text(topic)
     norm_question = _normalize_research_text(question)
 
+    # Dropped sessions are dead end states: a run produced nothing usable and
+    # the row was discarded (or could not be deleted). They must never match
+    # again, or they would suppress re-research forever.
+    def _alive(row: dict) -> bool:
+        return (row.get("status") or "").strip() != ResearchQuestion.STATUS_DROPPED
+
     # ── Exact pass ────────────────────────────────────────────────────────
     for row in known:
+        if not _alive(row):
+            continue
         same_topic = bool(norm_topic) and _normalize_research_text(row.get("topic")) == norm_topic
         same_question = bool(norm_question) and _normalize_research_text(row.get("question")) == norm_question
         if same_topic and same_question:
@@ -488,6 +506,8 @@ def check_topic_researched(
     best_sim = float("-inf")
     best_row = None
     for row in known:
+        if not _alive(row):
+            continue
         value = _as_similarity_embedding(row.get("embedding"))
         if value is None:
             continue
@@ -633,6 +653,105 @@ def delete_research_question(research_question_id: Optional[str]) -> None:
             "[Memory] Could not delete research session %s (%s: %s).",
             research_question_id, type(exc).__name__, exc,
         )
+
+
+# Research-question lifecycle state machine. A session moves through these
+# states explicitly:
+#
+#   proposed ──► researching ──► answered        (successful run)
+#      │              │
+#      │              └────────► dropped          (run produced nothing usable)
+#      └──────────────► dropped
+#
+# answered ──► researching is allowed for the re-research fallback: a matched
+# session whose stored sources cannot be hydrated is re-researched in place
+# rather than reusing an empty result. dropped is terminal: dead sessions are
+# never matched or reused again (see check_topic_researched).
+_RESEARCH_LIFECYCLE_NEXT: dict[str, set] = {
+    ResearchQuestion.STATUS_PROPOSED: {
+        ResearchQuestion.STATUS_RESEARCHING,
+        ResearchQuestion.STATUS_DROPPED,
+    },
+    ResearchQuestion.STATUS_RESEARCHING: {
+        ResearchQuestion.STATUS_ANSWERED,
+        ResearchQuestion.STATUS_DROPPED,
+    },
+    ResearchQuestion.STATUS_ANSWERED: {
+        ResearchQuestion.STATUS_RESEARCHING,
+        ResearchQuestion.STATUS_DROPPED,
+    },
+    ResearchQuestion.STATUS_DROPPED: set(),
+}
+
+
+def set_research_question_status(
+    research_question_id: Optional[str],
+    status: str,
+) -> bool:
+    """
+    Best-effort lifecycle transition for a research session.
+
+    Applies the explicit state machine defined by
+    ``ResearchQuestion.STATUS_*`` / ``_RESEARCH_LIFECYCLE_NEXT``: the current
+    status is read, an illegal transition (e.g. ``answered`` → ``proposed`` or
+    any move out of ``dropped``) is rejected with only a log line, and a
+    valid transition is written back to the ``research_questions`` row.
+
+    Never raises and never halts the pipeline: an unavailable store or a
+    missing session row only logs a warning and returns False (the caller
+    keeps its in-memory result intact). Returns True only when the transition
+    was both valid and issued.
+    """
+    if not research_question_id or not status:
+        return False
+    if status not in _RESEARCH_LIFECYCLE_NEXT:
+        log.warning("[Memory] Unknown research-question status '%s' – ignoring.", status)
+        return False
+
+    try:
+        supabase = _get_supabase()
+        result = (
+            supabase.table("research_questions")
+            .select("status")
+            .eq("id", research_question_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(
+            "[Memory] Could not read research session %s status (%s: %s) – skipping transition.",
+            research_question_id, type(exc).__name__, exc,
+        )
+        return False
+
+    rows = list(result.data or [])
+    if not rows:
+        log.warning(
+            "[Memory] No research session %s – skipping status transition.",
+            research_question_id,
+        )
+        return False
+
+    current = str(rows[0].get("status") or ResearchQuestion.STATUS_PROPOSED)
+    allowed = _RESEARCH_LIFECYCLE_NEXT.get(current, set())
+    if status not in allowed:
+        log.info(
+            "[Memory] Skipping invalid research-session transition %s → %s for %s.",
+            current, status, research_question_id,
+        )
+        return False
+
+    try:
+        supabase.table("research_questions").update({"status": status}).eq("id", research_question_id).execute()
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(
+            "[Memory] Could not update research session %s to %s (%s: %s).",
+            research_question_id, status, type(exc).__name__, exc,
+        )
+        return False
+
+    log.info("[Memory] Research session %s: status=%s → %s", research_question_id, current, status)
+    return True
 
 
 def get_known_source_urls() -> set[str]:

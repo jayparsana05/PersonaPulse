@@ -8,8 +8,8 @@ Handles all outbound social media publishing:
 Key Functions
 -------------
 - upload_linkedin_image(access_token, author_urn, image_bytes) → str | None
-- publish_to_linkedin(text, image_bytes) → None
-- publish_to_x(text) → None
+- publish_to_linkedin(text, image_bytes) → str | None   # → LinkedIn post URN (x-restli-id header)
+- publish_to_x(text) → str                             # → X tweet id
 - check_linkedin_token_health() → dict
 """
 
@@ -126,7 +126,7 @@ def publish_to_linkedin(
     text: str,
     image_bytes: Optional[bytes] = None,
     article_url: Optional[str] = None,
-) -> None:
+) -> Optional[str]:
     """
     Publish a UGC post to LinkedIn.
 
@@ -137,6 +137,11 @@ def publish_to_linkedin(
     If image_bytes is None (fallback):
       - Appends article_url to post body.
       - Creates a NONE shareMediaCategory (link preview) post.
+
+    Returns the LinkedIn post URN (e.g. ``urn:li:ugcPost:...``) that the API
+    reports in the ``x-restli-id`` response header when it is available,
+    otherwise None. The URN is recorded so the publishing layer can persist
+    per-platform post ids for deduplication.
 
     Raises RuntimeError on publish failure.
     """
@@ -164,7 +169,12 @@ def publish_to_linkedin(
             f"{exc.response.text[:300]}"
         ) from exc
 
-    log.info("[Publisher] ✅ LinkedIn post published: %s", resp.headers.get("x-linkedin-id", "n/a"))
+    # LinkedIn identifies the created post in the `x-restli-id` RESPONSE
+    # HEADER as a URN (e.g. urn:li:ugcPost:68447855235931240). This is the
+    # documented location of the post id for /v2/ugcPosts and /rest/posts.
+    post_id = resp.headers.get("x-restli-id")
+    log.info("[Publisher] ✅ LinkedIn post published: %s", post_id or "n/a")
+    return post_id
 
 
 def _build_linkedin_media_payload(author_urn: str, text: str, asset_urn: str) -> dict:
@@ -212,11 +222,13 @@ def _build_linkedin_text_payload(
 # X (Twitter): Publish Tweet
 # ---------------------------------------------------------------------------
 
-def publish_to_x(text: str) -> None:
+def publish_to_x(text: str) -> str:
     """
     Publish a plain-text tweet via the official X API v2 using tweepy.
 
     Uses OAuth 1.0a User Context (required for write operations on free tier).
+    Returns the tweet id (persisted for per-platform deduplication).
+
     Raises RuntimeError on failure.
     """
     if not (settings.X_API_KEY and settings.X_API_SECRET and settings.X_ACCESS_TOKEN and settings.X_ACCESS_SECRET):
@@ -233,6 +245,7 @@ def publish_to_x(text: str) -> None:
         response = client.create_tweet(text=text)
         tweet_id = response.data["id"]
         log.info("[Publisher] ✅ X tweet published: id=%s", tweet_id)
+        return str(tweet_id)
     except tweepy.TweepyException as exc:
         raise RuntimeError(f"[Publisher] X (Twitter) publish failed: {exc}") from exc
 

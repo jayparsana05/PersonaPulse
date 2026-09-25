@@ -490,14 +490,44 @@ class RunResearchTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class PersistResearchQuestionTest(unittest.TestCase):
+    """persist_research_question stores the question WITH its embedding so the
+    research-session memory can recognize reworded duplicates semantically."""
+
     def test_returns_uuid_when_store_succeeds(self):
-        with patch("src.agent.store_research_question", return_value="qid-9") as store:
+        with patch("src.agent.store_research_question", return_value="qid-9") as store, \
+             patch("src.agent.get_normalized_embedding", return_value=[0.1, 0.2]):
             question_id = persist_research_question(research_question_fixture())
         self.assertEqual(question_id, "qid-9")
-        store.assert_called_once_with(research_question_fixture())
+        store.assert_called_once_with(
+            research_question_fixture(),
+            embedding=[0.1, 0.2],
+        )
+
+    def test_embedding_is_computed_from_topic_and_question(self):
+        with patch("src.agent.store_research_question", return_value="qid-9"), \
+             patch("src.agent.get_normalized_embedding", return_value=[0.5]) as embed:
+            persist_research_question(research_question_fixture())
+        embed.assert_called_once_with(
+            "Agentic orchestration "
+            "Which orchestration framework scales best for production agents?"
+        )
+
+    def test_embedding_failure_still_stores_without_embedding(self):
+        """An embedding API failure must not drop persistence: the row is
+        stored without an embedding (exact matching still works)."""
+        with patch("src.agent.store_research_question", return_value="qid-9") as store, \
+             patch("src.agent.get_normalized_embedding",
+                   side_effect=RuntimeError("embedding down")):
+            question_id = persist_research_question(research_question_fixture())
+        self.assertEqual(question_id, "qid-9")
+        store.assert_called_once_with(
+            research_question_fixture(),
+            embedding=None,
+        )
 
     def test_returns_none_when_store_is_unavailable(self):
-        with patch("src.agent.store_research_question", side_effect=RuntimeError("db down")):
+        with patch("src.agent.store_research_question", side_effect=RuntimeError("db down")), \
+             patch("src.agent.get_normalized_embedding", return_value=[0.1, 0.2]):
             question_id = persist_research_question(research_question_fixture())
         self.assertIsNone(question_id)
 
@@ -604,6 +634,8 @@ class MemorySim:
         norm_topic = self._norm(topic)
         norm_question = self._norm(question)
         for session in self.sessions:
+            if (session["meta"].get("status") or "").strip() == "dropped":
+                continue
             same_topic = bool(norm_topic) and self._norm(session["topic"]) == norm_topic
             same_question = bool(norm_question) and self._norm(session["question"]) == norm_question
             if same_topic and same_question:
@@ -621,7 +653,7 @@ class MemorySim:
                 return list(session["sources"]), list(session["source_ids"])
         return [], []
 
-    def store_research_question(self, rq):
+    def store_research_question(self, rq, embedding=None):
         question_id = f"qid-{self._next}"
         self._next += 1
         meta = {"id": question_id, "topic": rq.topic, "question": rq.question,
@@ -655,6 +687,14 @@ class MemorySim:
     def delete_research_question(self, research_question_id):
         self.sessions[:] = [s for s in self.sessions if s["id"] != research_question_id]
 
+    def set_research_question_status(self, research_question_id, status):
+        for session in self.sessions:
+            if session["id"] == research_question_id:
+                session["meta"]["status"] = status
+                session["status"] = status
+                return True
+        return False
+
     def seed(self, question_id="qid-old", with_sources=False):
         """Pre-seed a remembered session for the fixture topic/question."""
         rq = research_question_fixture()
@@ -674,8 +714,10 @@ class MemorySim:
             check_topic_researched=self.check_topic_researched,
             get_research_sources_for_question=self.get_research_sources_for_question,
             get_known_source_urls=lambda: set(),
+            get_normalized_embedding=lambda _text: [0.1, 0.2],
             store_research_question=self.store_research_question,
             store_research_sources=self.store_research_sources,
+            set_research_question_status=self.set_research_question_status,
             delete_research_question=self.delete_research_question,
         ), patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
            patch("src.research.search_news", side_effect=search_side_effect) as search_mock:
@@ -724,6 +766,8 @@ class RunResearchOrReuseTest(unittest.TestCase):
                 "matched": False, "reason": None, "question_id": None,
                 "matched_question": None, "similarity": 0.4,
             }), \
+             patch("src.agent.get_normalized_embedding", return_value=[0.1, 0.2]), \
+             patch("src.agent.set_research_question_status") as set_status, \
              patch("src.agent.store_research_question", return_value="qid-new") as store_q, \
              patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
              patch("src.research.search_news", return_value=[raw_result(url="https://ex.com/1")]), \
@@ -736,9 +780,18 @@ class RunResearchOrReuseTest(unittest.TestCase):
         self.assertEqual(result["research_question_id"], "qid-new")
         self.assertEqual(len(result["research_sources"]), 1)
         store_q.assert_called_once()
+        self.assertTrue(
+            any(
+                c.args == ("qid-new", ResearchQuestion.STATUS_ANSWERED)
+                for c in set_status.call_args_list
+            ),
+            "successful research must close the session as answered",
+        )
 
     def test_memory_unavailable_does_not_prevent_research(self):
         with patch("src.agent.check_topic_researched", side_effect=RuntimeError("db down")), \
+             patch("src.agent.get_normalized_embedding", return_value=[0.1, 0.2]), \
+             patch("src.agent.set_research_question_status"), \
              patch("src.agent.store_research_question", return_value="qid-new"), \
              patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
              patch("src.research.search_news", return_value=[raw_result(url="https://ex.com/1")]), \
@@ -755,6 +808,8 @@ class RunResearchOrReuseTest(unittest.TestCase):
                 "question_id": "qid-old", "matched_question": {}, "similarity": None,
             }), \
              patch("src.agent.get_research_sources_for_question", return_value=([], [])), \
+             patch("src.agent.get_normalized_embedding", return_value=[0.1, 0.2]), \
+             patch("src.agent.set_research_question_status") as set_status, \
              patch("src.agent.store_research_question", return_value="qid-new") as store_q, \
              patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
              patch("src.research.search_news",
@@ -769,6 +824,13 @@ class RunResearchOrReuseTest(unittest.TestCase):
         self.assertEqual(len(result["research_sources"]), 1)
         store_q.assert_called_once()
         search.assert_called_once()
+        self.assertTrue(
+            any(
+                c.args == ("qid-new", ResearchQuestion.STATUS_ANSWERED)
+                for c in set_status.call_args_list
+            ),
+            "successful research must close the session as answered",
+        )
 
 
 def _hydration_failure(*args, **kwargs):
@@ -792,6 +854,16 @@ class RunResearchOrReuseMemoryTest(unittest.TestCase):
         with self.sim.search(search_results) as search:
             result = run_research_or_reuse(research_question_fixture(), **kwargs)
         return result, search
+
+    def _run_supplied(self, search_results, **kwargs):
+        """Run the fixture question against the caller-supplied session
+        'qid-ext' (bypassing the reuse gate, as a direct re-research would)."""
+        return self._run(
+            search_results,
+            research_question_id="qid-ext",
+            reuse_researched=False,
+            **kwargs,
+        )
 
     def test_first_attempt_without_sources_then_next_run_researches_fresh(self):
         first, _ = self._run([[]])
@@ -835,8 +907,10 @@ class RunResearchOrReuseMemoryTest(unittest.TestCase):
             check_topic_researched=self.sim.check_topic_researched,
             get_research_sources_for_question=self.sim.get_research_sources_for_question,
             get_known_source_urls=lambda: set(),
+            get_normalized_embedding=lambda _text: [0.1, 0.2],
             store_research_question=self.sim.store_research_question,
             store_research_sources=self.sim.store_research_sources,
+            set_research_question_status=self.sim.set_research_question_status,
             delete_research_question=self.sim.delete_research_question,
         ), patch("src.research.complete_text",
                             return_value=_dump({"queries": ["q"]})), \
@@ -863,8 +937,10 @@ class RunResearchOrReuseMemoryTest(unittest.TestCase):
             check_topic_researched=self.sim.check_topic_researched,
             get_research_sources_for_question=_hydration_failure,
             get_known_source_urls=lambda: set(),
+            get_normalized_embedding=lambda _text: [0.1, 0.2],
             store_research_question=self.sim.store_research_question,
             store_research_sources=self.sim.store_research_sources,
+            set_research_question_status=self.sim.set_research_question_status,
             delete_research_question=self.sim.delete_research_question,
         ), patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
             patch("src.research.search_news",
@@ -896,9 +972,11 @@ class RunResearchOrReuseMemoryTest(unittest.TestCase):
             check_topic_researched=self.sim.check_topic_researched,
             get_research_sources_for_question=self.sim.get_research_sources_for_question,
             get_known_source_urls=lambda: {"https://ex.com/known"},
+            get_normalized_embedding=lambda _text: [0.1, 0.2],
             store_research_question=self.sim.store_research_question,
             store_research_sources=store_research_sources,
             link_research_sources=link_research_sources,
+            set_research_question_status=self.sim.set_research_question_status,
             delete_research_question=self.sim.delete_research_question,
         ), patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
             patch("src.research.search_news", side_effect=search_results) as search:
@@ -944,10 +1022,13 @@ class RunResearchOrReuseMemoryTest(unittest.TestCase):
         store2.assert_not_called()
         second_search.assert_not_called()
 
-    def test_all_sources_known_keeps_session_when_linking_writes_no_rows(self):
-        """Even when the link persistence is unavailable (returns no row ids /
-        raises), a run that discovered valid sources is retained: an empty
-        'research_source_ids' alone must not trigger session cleanup."""
+    def test_all_sources_known_with_linking_failure_session_not_remembered(self):
+        """A run that discovered valid sources yet persisted NOTHING (full
+        records skipped because every source was already known, and the link
+        persistence also failed) must NOT be marked answered: an in-memory
+        result alone is not a reusable answer. The fresh session is dropped and
+        discarded so a later identical run researches fresh instead of trusting
+        a ghost 'answered' session with no persisted sources."""
         def _link_failure(question_id, sources):
             raise RuntimeError("store unavailable")
 
@@ -956,12 +1037,237 @@ class RunResearchOrReuseMemoryTest(unittest.TestCase):
             _link_failure,
             [[raw_result(url="https://ex.com/known")]],
         )
-        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["status"], "ok")   # in-memory result still flows
         self.assertEqual(result["research_source_ids"], [])
         self.assertEqual(len(result["research_sources"]), 1)
-        self.assertIsNotNone(result["research_question_id"])
-        # The newly created session is still there (not deleted).
+        # Nothing persisted → not remembered (dropped + deleted).
+        self.assertEqual(self.sim.sessions, [])
+        self.assertIsNone(result["research_question_id"])
+        search.assert_called_once()
+
+        # Round 2: identical question researches fresh again (no ghost session).
+        result2, search2 = self._run_all_known(
+            Mock(),
+            _link_failure,
+            [[raw_result(url="https://ex.com/known")]],
+        )
+        self.assertEqual(result2["status"], "ok")
+        search2.assert_called_once()
+
+    def test_store_failure_fresh_session_is_not_answered(self):
+        """A run whose sources exist only in memory (persistence raised) must
+        not close its freshly created session as answered."""
+        def _store_fails(question_id, sources):
+            raise RuntimeError("store down")
+
+        with patch.multiple(
+            "src.agent",
+            check_topic_researched=self.sim.check_topic_researched,
+            get_research_sources_for_question=self.sim.get_research_sources_for_question,
+            get_known_source_urls=lambda: set(),
+            get_normalized_embedding=lambda _text: [0.1, 0.2],
+            store_research_question=self.sim.store_research_question,
+            store_research_sources=_store_fails,
+            set_research_question_status=self.sim.set_research_question_status,
+            delete_research_question=self.sim.delete_research_question,
+        ), patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+            patch("src.research.search_news",
+                  return_value=[raw_result(url="https://ex.com/ok")]):
+            result = run_research_or_reuse(research_question_fixture())
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["research_source_ids"], [])
+        self.assertIsNone(result["research_question_id"])
+        self.assertEqual(self.sim.sessions, [])
+
+    def test_existing_session_unpersisted_run_not_marked_answered(self):
+        """A caller-supplied (not freshly created) session that re-researches
+        but cannot persist must NOT be closed as answered: its old on-disk data
+        remains authoritative and the row is kept (no destructive cleanup of a
+        session we did not create here)."""
+        self.sim.seed("qid-ext", with_sources=False)
+
+        def _store_fails(question_id, sources):
+            raise RuntimeError("store down")
+
+        with patch.multiple(
+            "src.agent",
+            check_topic_researched=self.sim.check_topic_researched,
+            get_research_sources_for_question=self.sim.get_research_sources_for_question,
+            get_known_source_urls=lambda: set(),
+            get_normalized_embedding=lambda _text: [0.1, 0.2],
+            store_research_question=self.sim.store_research_question,
+            store_research_sources=_store_fails,
+            set_research_question_status=self.sim.set_research_question_status,
+            delete_research_question=self.sim.delete_research_question,
+        ), patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+            patch("src.research.search_news",
+                  return_value=[raw_result(url="https://ex.com/ok")]):
+            result = run_research_or_reuse(research_question_fixture(), research_question_id="qid-ext")
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["research_question_id"], "qid-ext")
+        self.assertEqual(result["research_source_ids"], [])
         self.assertEqual(len(self.sim.sessions), 1)
+        # Terminal, not stuck: never answered on in-memory data alone, and the
+        # caller-owned row is retained (no destructive cleanup).
+        self.assertEqual(
+            self.sim.sessions[0]["meta"]["status"], ResearchQuestion.STATUS_DROPPED,
+            "an unpersisted re-research must close the session as dropped (terminal), "
+            "never left stuck and never marked answered",
+        )
+
+    def test_existing_session_successful_persistence_is_answered(self):
+        """A caller-supplied session whose sources ARE persisted must be
+        closed as answered (terminal) — not left 'researching'."""
+        self.sim.seed("qid-ext", with_sources=False)
+        result, _ = self._run_supplied([[raw_result(url="https://ex.com/ok")]])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["research_question_id"], "qid-ext")
+        self.assertEqual(len(result["research_source_ids"]), 1)
+        self.assertEqual(
+            self.sim.sessions[0]["meta"]["status"], ResearchQuestion.STATUS_ANSWERED,
+            "successful research + persisted sources must close the session answered",
+        )
+
+    def test_existing_session_persistence_failure_is_dropped_not_stuck(self):
+        """A caller-supplied session whose run discovered sources but could
+        not persist them must be closed as dropped, so it is never re-matched
+        and never remains stuck in 'researching'."""
+        def _store_fails(question_id, sources):
+            raise RuntimeError("store down")
+
+        self.sim.seed("qid-ext", with_sources=False)
+        with patch.multiple(
+            "src.agent",
+            check_topic_researched=self.sim.check_topic_researched,
+            get_research_sources_for_question=self.sim.get_research_sources_for_question,
+            get_known_source_urls=lambda: set(),
+            get_normalized_embedding=lambda _text: [0.1, 0.2],
+            store_research_question=self.sim.store_research_question,
+            store_research_sources=_store_fails,
+            set_research_question_status=self.sim.set_research_question_status,
+            delete_research_question=self.sim.delete_research_question,
+        ), patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+            patch("src.research.search_news",
+                  return_value=[raw_result(url="https://ex.com/ok")]):
+            result = run_research_or_reuse(
+                research_question_fixture(),
+                research_question_id="qid-ext",
+                reuse_researched=False,
+            )
+
+        self.assertEqual(result["status"], "ok")          # in-memory result still flows
+        self.assertEqual(result["research_source_ids"], [])
+        self.assertEqual(result["research_question_id"], "qid-ext")  # caller-owned row kept
+        self.assertEqual(len(self.sim.sessions), 1)
+        self.assertEqual(
+            self.sim.sessions[0]["meta"]["status"], ResearchQuestion.STATUS_DROPPED,
+            "persistence failure on an existing session must close it as dropped",
+        )
+
+    def test_existing_session_empty_research_is_dropped_not_stuck(self):
+        """A caller-supplied session whose research yields no usable sources
+        must be closed as dropped (terminal), never stuck in 'researching'."""
+        self.sim.seed("qid-ext", with_sources=False)
+        result, _ = self._run_supplied([[]])
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(result["research_question_id"], "qid-ext")
+        self.assertEqual(len(self.sim.sessions), 1)
+        self.assertEqual(
+            self.sim.sessions[0]["meta"]["status"], ResearchQuestion.STATUS_DROPPED,
+            "empty research on an existing session must close it as dropped",
+        )
+
+    def test_existing_session_research_stage_exception_is_dropped(self):
+        """A research-stage exception on a caller-supplied session must close
+        it as dropped (terminal) — not leave it stuck in 'researching'."""
+        self.sim.seed("qid-ext", with_sources=False)
+        with patch("src.agent.run_research",
+                   side_effect=RuntimeError("research stage exploded")), \
+             patch("src.agent.check_topic_researched", return_value={"matched": False}), \
+             patch("src.agent.get_normalized_embedding", return_value=[0.1, 0.2]), \
+             patch("src.agent.set_research_question_status",
+                   self.sim.set_research_question_status), \
+             patch("src.agent.delete_research_question", self.sim.delete_research_question):
+            result = run_research_or_reuse(
+                research_question_fixture(),
+                research_question_id="qid-ext",
+                reuse_researched=False,
+            )
+
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(result["research_source_ids"], [])
+        self.assertEqual(result["research_question_id"], "qid-ext")  # caller-owned row kept
+        self.assertEqual(len(self.sim.sessions), 1)
+        self.assertEqual(
+            self.sim.sessions[0]["meta"]["status"], ResearchQuestion.STATUS_DROPPED,
+            "a research-stage exception must close the session as dropped, not stuck",
+        )
+
+    def test_research_stage_exception_closes_fresh_session_as_dropped(self):
+        """A research-stage exception on a freshly created session must close
+        it as dropped and best-effort delete the row."""
+        with patch("src.agent.run_research",
+                   side_effect=RuntimeError("research stage exploded")), \
+             patch("src.agent.check_topic_researched", return_value={"matched": False}), \
+             patch("src.agent.get_normalized_embedding", return_value=[0.1, 0.2]), \
+             patch("src.agent.store_research_question", self.sim.store_research_question), \
+             patch("src.agent.set_research_question_status",
+                   self.sim.set_research_question_status), \
+             patch("src.agent.delete_research_question", self.sim.delete_research_question):
+            result = run_research_or_reuse(research_question_fixture())
+
+        self.assertEqual(result["status"], "empty")
+        self.assertIsNone(result["research_question_id"])
+        self.assertEqual(self.sim.sessions, [])
+
+    def test_successful_run_marks_session_answered(self):
+        """Lifecycle: a successful research run closes the session as answered."""
+        result, _ = self._run([[raw_result(url="https://ex.com/a")]])
+        self.assertEqual(result["status"], "ok")
+        qid = result["research_question_id"]
+        self.assertEqual(self.sim.sessions[0]["meta"]["status"], ResearchQuestion.STATUS_ANSWERED)
+        self.assertEqual(self.sim.sessions[0]["id"], qid)
+
+    def test_dropped_session_never_reused_when_delete_fails(self):
+        """Lifecycle: an empty run marks its fresh session dropped; when the
+        subsequent delete fails, the dead session must never be matched (and
+        reused) again — the next run researches fresh instead."""
+        def _delete_fails(question_id):
+            raise RuntimeError("db down")
+
+        def _pipeline(delete, search_results):
+            with patch.multiple(
+                "src.agent",
+                check_topic_researched=self.sim.check_topic_researched,
+                get_research_sources_for_question=self.sim.get_research_sources_for_question,
+                get_known_source_urls=lambda: set(),
+                get_normalized_embedding=lambda _text: [0.1, 0.2],
+                store_research_question=self.sim.store_research_question,
+                store_research_sources=self.sim.store_research_sources,
+                set_research_question_status=self.sim.set_research_question_status,
+                delete_research_question=delete,
+            ), patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+                patch("src.research.search_news", side_effect=search_results) as search:
+                result = run_research_or_reuse(research_question_fixture())
+            return result, search
+
+        first, _ = _pipeline(_delete_fails, [[]])
+        self.assertEqual(first["status"], "empty")
+        self.assertIsNotNone(first["research_question_id"])
+        # Delete failed → the dead row survives, but is marked dropped.
+        self.assertEqual(len(self.sim.sessions), 1)
+        self.assertEqual(
+            self.sim.sessions[0]["meta"]["status"], ResearchQuestion.STATUS_DROPPED,
+        )
+
+        # Round 2: the dropped session is skipped → fresh research, new session.
+        second, search = _pipeline(self.sim.delete_research_question, [[raw_result(url="https://ex.com/fresh")]])
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(second["duplicate_reason"], None)
+        self.assertNotEqual(second["research_question_id"], first["research_question_id"])
+        self.assertEqual(len(self.sim.sessions), 2)
         search.assert_called_once()
 
 

@@ -58,6 +58,7 @@ from src.memory import (
     get_research_sources_for_question,
     get_style_profile,
     link_research_sources,
+    set_research_question_status,
     store_draft,
     store_research_question,
     store_research_sources,
@@ -598,9 +599,25 @@ def run_selection(
 
 def persist_research_question(rq) -> Optional[str]:
     """Persist a ResearchQuestion and return its UUID, or None when the store
-    is unavailable. Non-blocking: callers continue in-memory either way."""
+    is unavailable. Non-blocking: callers continue in-memory either way.
+
+    The question is stored WITH its semantic embedding (topic + question), so
+    the research-session memory can recognize a lightly reworded duplicate on
+    a later run. Embedding failures are non-blocking: the row is stored
+    without an embedding (exact matching still works).
+    """
+    embedding: Optional[list] = None
     try:
-        question_id = store_research_question(rq)
+        embedding = get_normalized_embedding(
+            f"{getattr(rq, 'topic', rq)} {getattr(rq, 'question', rq)}".strip()
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(
+            "⚠️  Could not embed research question (%s: %s) – storing without embedding.",
+            type(exc).__name__, exc,
+        )
+    try:
+        question_id = store_research_question(rq, embedding=embedding)
         log.info("  💾 Research question stored – id=%s", question_id)
         return question_id
     except Exception as exc:  # pylint: disable=broad-except
@@ -789,16 +806,35 @@ def run_research_or_reuse(
     - Memory unavailable / embedding failure: research runs normally
       (non-blocking, matching the rest of the research agent).
 
+    Session lifecycle: the ``research_questions`` status advances explicitly
+    through the state machine — ``researching`` when the run begins, then ANY
+    session that reached ``researching`` always lands on a terminal state by
+    the end of this run:
+
+    - ``answered``  — the run produced usable sources AND they were *durably
+      persisted* (research_source_ids non-empty: full source rows or
+      per-session link rows);
+    - ``dropped``   — every other outcome (no usable sources, sources that
+      could not be persisted, or a research-stage exception).
+
+    This applies to BOTH sessions created by this run and sessions supplied by
+    the caller via *research_question_id*, so no session can ever remain
+    permanently stuck mid-flight. A session is never answered based on
+    in-memory data alone. All transitions are best-effort and non-blocking (an
+    unavailable store never halts research).
+
     When *research_question_id* is None and a brand-new question proceeds to
     research, the new question row is persisted first so the collected sources
     stay traceable (same mechanism the CLI entry points already used). The
-    freshly created session is discarded ONLY when the run produced no usable
-    research sources at all (failure / empty results); a run that discovered
-    valid sources is retained even when persistence recorded no NEW full rows
-    (e.g. every source was already stored in an earlier session — in which
-    case lightweight per-session link rows are recorded instead, and
-    hydration re-loads the source content from the existing records), so a
-    successful session is always reusable later.
+    freshly created session is retained (marked answered) ONLY when its source
+    data was durably persisted: either as full source rows, or as per-session
+    link rows when every discovered source was already stored in an earlier
+    session (hydration re-loads the content from the existing records). A
+    fresh session whose run produced no usable sources, or whose sources could
+    not be persisted at all, is marked dropped and best-effort deleted so it
+    can never masquerade as a remembered (reusable) answer. A session that was
+    NOT created by this run is only ever marked dropped (never deleted: the
+    caller owns that row).
 
     Returns
     -------
@@ -860,30 +896,80 @@ def run_research_or_reuse(
         research_question_id = persist_research_question(rq)
         created_id = research_question_id
 
-    result = run_research(
-        rq,
-        research_question_id=research_question_id,
-        use_llm=use_llm,
-        max_queries=max_queries,
-        max_sources_per_query=max_sources_per_query,
-        max_sources=max_sources,
-        min_score=min_score,
-        skip_known_sources=skip_known_sources,
-    )
+    # ── Lifecycle: from this point the session is actively researched. ─────
+    # Best-effort state transition (proposed → researching). Re-entering an
+    # existing session (e.g. the re-research fallback when a matched session
+    # could not hydrate) is allowed by the state machine (answered →
+    # researching). Non-blocking: failures only log.
+    if research_question_id:
+        set_research_question_status(research_question_id, ResearchQuestion.STATUS_RESEARCHING)
+
+    result: dict = {}
+    try:
+        result = run_research(
+            rq,
+            research_question_id=research_question_id,
+            use_llm=use_llm,
+            max_queries=max_queries,
+            max_sources_per_query=max_sources_per_query,
+            max_sources=max_sources,
+            min_score=min_score,
+            skip_known_sources=skip_known_sources,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        # A research-stage exception must never leave a session mid-flight:
+        # treat it exactly like an empty run so the lifecycle close below
+        # closes the session as dropped (and discards a freshly created row).
+        log.warning(
+            "⚠️  Research stage raised for session %s (%s: %s) – treating as empty.",
+            research_question_id, type(exc).__name__, exc,
+        )
+        result = {
+            "research_question": rq,
+            "research_sources": [],
+            "status": "empty",
+            "research_source_ids": [],
+        }
     result["reused_question_id"] = None
     result["duplicate_reason"] = None
     result["research_question_id"] = research_question_id
 
-    # A brand-new session that yielded NO usable research sources must not
-    # linger as a remembered (but empty) session: the next run for the same
-    # question would otherwise hint a reuse and then fall back to research
-    # anyway. Successful research is always kept – even when "research_source_ids"
-    # is empty because every discovered source was already stored in an earlier
-    # session (cross-session dedup) or the source rows could not be persisted.
+    # ── Lifecycle close ──────────────────────────────────────────────────
+    # ANY session that was moved to "researching" must reach a terminal
+    # state on this run, whether its row was created by THIS run or supplied
+    # by the caller. "answered" is recorded ONLY when the session's source
+    # data was durably persisted (research_source_ids non-empty: full source
+    # rows or per-session link rows). Every other outcome — no usable
+    # sources, sources that could not be persisted, or a research-stage
+    # exception — closes the session as "dropped": terminal, never matched
+    # again, never stuck mid-flight. All transitions stay
+    # best-effort/non-blocking.
     usable = bool(result.get("research_sources"))
-    if created_id is not None and not usable:
+    persisted = bool(result.get("research_source_ids"))
+    if research_question_id:
+        if usable and persisted:
+            set_research_question_status(research_question_id, ResearchQuestion.STATUS_ANSWERED)
+        else:
+            log.warning(
+                "⚠️  Session %s closed as 'dropped' (%s).",
+                research_question_id,
+                "no usable research sources" if not usable
+                else "sources could not be persisted",
+            )
+            set_research_question_status(research_question_id, ResearchQuestion.STATUS_DROPPED)
+
+    # A brand-new session that produced NO usable research sources (or whose
+    # sources could NOT be persisted) must not linger as a remembered (but
+    # empty) session: the next run for the same question would otherwise hint
+    # a reuse and then fall back to research anyway. Delete such freshly
+    # created rows best-effort (they were marked dropped above) so they can
+    # never masquerade as a remembered answer. A session NOT created by this
+    # run is never deleted — only marked dropped — because the caller owns
+    # that row.
+    if created_id is not None and not (usable and persisted):
         log.warning(
-            "🧽 Research produced nothing persistable for new session %s – discarding it (not remembered).",
+            "🧽 Fresh session %s holds nothing reusable (no usable sources, or sources could "
+            "not be persisted) – discarding it (not remembered).",
             created_id,
         )
         try:
@@ -1383,6 +1469,11 @@ def run_research_agent(
         log.warning("[Agent] Research returned no usable sources (status=research_empty).")
         if not result["already_researched"] and result["research_question_id"]:
             try:
+                # Lifecycle: mark the session dropped (so it can never match
+                # again, even if the delete below fails) before removing it.
+                set_research_question_status(
+                    result["research_question_id"], ResearchQuestion.STATUS_DROPPED,
+                )
                 delete_research_question(result["research_question_id"])
                 log.info("[Agent] Cleaned up empty research session %s.",
                          result["research_question_id"])

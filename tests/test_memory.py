@@ -4,7 +4,7 @@ Unit tests for src.memory.store_draft row construction.
 Covers:
 - article_url and image_url are stored as separate columns
 - the embedding is serialized as a pgvector literal
-- status defaults to PENDING
+- status defaults to PENDING (top-level + per-platform)
 - optional URL columns default to None
 
 Uses a fake Supabase client, so no network or API keys are needed.
@@ -42,6 +42,7 @@ from src.memory import (  # noqa: E402
     get_known_source_urls,
     get_research_sources_for_question,
     link_research_sources,
+    set_research_question_status,
     store_draft,
     store_research_question,
     store_research_sources,
@@ -131,6 +132,11 @@ class StoreDraftTest(unittest.TestCase):
     def test_status_is_pending(self):
         self._store()
         self.assertEqual(self.fake_client.row["status"], "PENDING")
+
+    def test_per_platform_statuses_default_to_pending(self):
+        self._store()
+        self.assertEqual(self.fake_client.row["linkedin_status"], "PENDING")
+        self.assertEqual(self.fake_client.row["x_status"], "PENDING")
 
 
 class StoreResearchQuestionTest(unittest.TestCase):
@@ -447,6 +453,28 @@ class CheckTopicResearchedTest(unittest.TestCase):
             )
         self.assertFalse(result["matched"])
 
+    def test_dropped_session_never_matches_exactly_or_semantically(self):
+        """A dead (dropped) session must never be treated as researched, in
+        either the exact or the semantic pass."""
+        dropped = {
+            "id": "qid-dead",
+            "topic": "Agentic orchestration",
+            "question": "Which orchestration framework scales best?",
+            "status": "dropped",
+            "embedding": [1.0, 0.0],
+        }
+        with patch("src.memory.get_known_research_questions", return_value=[dropped]) as known, \
+             patch("src.memory.get_normalized_embedding", return_value=[1.0, 0.0]) as embed:
+            result = check_topic_researched(
+                "Agentic orchestration",
+                "Which orchestration framework scales best?",
+                use_embedding=True,
+            )
+        self.assertFalse(result["matched"])
+        self.assertIsNone(result["question_id"])
+        known.assert_called_once()
+        embed.assert_called_once()  # the semantic pass still ran but skipped the dropped row
+
 
 class GetKnownResearchQuestionsTest(unittest.TestCase):
     def test_returns_rows_from_research_questions(self):
@@ -703,6 +731,96 @@ class DeleteResearchQuestionTest(unittest.TestCase):
     def test_store_failure_is_non_blocking(self):
         with patch("src.memory._get_supabase", side_effect=RuntimeError("db down")):
             delete_research_question("qid-1")
+
+
+class FakeStatusSupabase:
+    """Chainable fake for set_research_question_status (select-then-update)."""
+
+    def __init__(self, select_rows, raise_on=None):
+        self.select_rows = select_rows
+        self.raise_on = raise_on
+        self.updated = None
+
+    def table(self, name):
+        return self
+
+    def select(self, *cols):
+        return self
+
+    def limit(self, n):
+        return self
+
+    def update(self, row):
+        self.updated = row
+        return self
+
+    def eq(self, col, val):
+        return self
+
+    def execute(self):
+        if self.raise_on is not None:
+            raise self.raise_on
+        if self.updated is not None:
+            return FakeResultWithData([{}])
+        return FakeResultWithData(self.select_rows)
+
+
+class SetResearchQuestionStatusTest(unittest.TestCase):
+    """set_research_question_status enforces the research-session lifecycle
+    state machine (proposed → researching → answered/dropped)."""
+
+    def _set(self, current="proposed", question_id="qid-1", status="researching", **kwargs):
+        fake = FakeStatusSupabase([{"id": question_id, "status": current}], **kwargs)
+        with patch("src.memory._get_supabase", return_value=fake):
+            ok = set_research_question_status(question_id, status)
+        return ok, fake
+
+    def test_valid_transition_is_written_back(self):
+        ok, fake = self._set(current="proposed", status="researching")
+        self.assertTrue(ok)
+        self.assertEqual(fake.updated, {"status": "researching"})
+
+    def test_researching_to_answered_is_allowed(self):
+        ok, _ = self._set(current="researching", status="answered")
+        self.assertTrue(ok)
+
+    def test_researching_to_dropped_is_allowed(self):
+        ok, _ = self._set(current="researching", status="dropped")
+        self.assertTrue(ok)
+
+    def test_illegal_jump_proposed_to_answered_is_rejected(self):
+        ok, fake = self._set(current="proposed", status="answered")
+        self.assertFalse(ok)
+        self.assertIsNone(fake.updated)
+
+    def test_illegal_unknown_target_is_rejected(self):
+        ok, _ = self._set(current="proposed", status="publish_ready")
+        self.assertFalse(ok)
+
+    def test_no_transition_out_of_dropped(self):
+        ok, fake = self._set(current="dropped", status="answered")
+        self.assertFalse(ok)
+        self.assertIsNone(fake.updated)
+
+    def test_unknown_session_returns_false(self):
+        fake = FakeStatusSupabase([])
+        with patch("src.memory._get_supabase", return_value=fake):
+            ok = set_research_question_status("qid-missing", "answered")
+        self.assertFalse(ok)
+
+    def test_store_failure_is_non_blocking(self):
+        ok, _ = self._set(
+            current="proposed",
+            status="researching",
+            raise_on=RuntimeError("db down"),
+        )
+        self.assertFalse(ok)
+
+    def test_no_id_does_not_touch_the_store(self):
+        with patch("src.memory._get_supabase") as sb:
+            self.assertFalse(set_research_question_status(None, "researching"))
+            self.assertFalse(set_research_question_status("", "researching"))
+        sb.assert_not_called()
 
 
 if __name__ == "__main__":

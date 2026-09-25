@@ -249,6 +249,8 @@ def mocked_pipeline(
                 patch("src.agent.get_known_source_urls", return_value=set())),
             "store_q": _stack.enter_context(
                 patch("src.agent.store_research_question", return_value="qid-fresh")),
+            "set_status": _stack.enter_context(
+                patch("src.agent.set_research_question_status")),
             "store_s": _stack.enter_context(
                 patch("src.agent.store_research_sources", return_value=["src-1"])),
             "delete_q": _stack.enter_context(
@@ -311,6 +313,10 @@ class RunResearchAgentTest(unittest.TestCase):
         self.assertEqual(m["store_s"].call_args.args[0], "qid-fresh")
         self.assertEqual(len(m["store_s"].call_args.args[1]), 1)
 
+        # Lifecycle: the session was opened as researching and closed answered.
+        m["set_status"].assert_any_call("qid-fresh", "researching")
+        m["set_status"].assert_any_call("qid-fresh", "answered")
+
         # Draft stored + Telegram approval requested; never published.
         m["store_draft"].assert_called_once()
         m["alert"].assert_called_once()
@@ -372,6 +378,7 @@ class RunResearchAgentTest(unittest.TestCase):
         self.assertIsNone(result["research_question_id"])
         m["search"].assert_called_once()
         m["delete_q"].assert_called_once_with("qid-fresh")
+        m["set_status"].assert_any_call("qid-fresh", "dropped")
         m["alert"].assert_not_called()
         m["publish_li"].assert_not_called()
         m["publish_x"].assert_not_called()

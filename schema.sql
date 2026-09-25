@@ -23,9 +23,31 @@ CREATE TABLE IF NOT EXISTS posts (
     article_url TEXT,
     image_url   TEXT,
     embedding   VECTOR(768),                                           -- gemini-embedding-001 @ 768-dim, L2-normalized
-    status      VARCHAR(32)   DEFAULT 'PENDING',                       -- PENDING | PUBLISHED | REJECTED | PARTIAL_FAILURE
-    created_at  TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    status      VARCHAR(32)   DEFAULT 'PENDING',                       -- PENDING | PUBLISHING | PUBLISHED | PARTIAL_FAILURE | REJECTED
+    linkedin_status VARCHAR(32) DEFAULT 'PENDING',                     -- per-platform: PENDING | PUBLISHED | FAILED
+    x_status         VARCHAR(32) DEFAULT 'PENDING',
+    linkedin_post_id TEXT,                                             -- LinkedIn post URN from x-restli-id response header
+    x_post_id        TEXT,                                             -- X tweet id from data.id
+    created_at  TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP     -- set on every status transition (claim/approve/reject)
 );
+
+-- Idempotent migrations for existing installs (CREATE TABLE IF NOT EXISTS
+-- does not add new columns to an already-created table).
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS linkedin_status VARCHAR(32) DEFAULT 'PENDING';
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS x_status         VARCHAR(32) DEFAULT 'PENDING';
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS linkedin_post_id TEXT;
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS x_post_id        TEXT;
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS updated_at       TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+
+-- Backfill per-platform statuses + updated_at for legacy rows so existing
+-- installs can be retried/claimed correctly (only ever mirrors the
+-- top-level flag).
+UPDATE posts
+SET    linkedin_status = CASE WHEN status = 'PUBLISHED' THEN 'PUBLISHED' ELSE 'PENDING' END,
+       x_status        = CASE WHEN status = 'PUBLISHED' THEN 'PUBLISHED' ELSE 'PENDING' END,
+       updated_at      = created_at
+WHERE  linkedin_status IS NULL OR x_status IS NULL OR updated_at IS NULL;
 
 -- HNSW index for fast approximate nearest-neighbor cosine search
 CREATE INDEX IF NOT EXISTS posts_embedding_idx
@@ -34,6 +56,7 @@ CREATE INDEX IF NOT EXISTS posts_embedding_idx
 -- Index for efficient status-based filtering (used by cleanup routine)
 CREATE INDEX IF NOT EXISTS posts_status_idx ON posts (status);
 CREATE INDEX IF NOT EXISTS posts_created_at_idx ON posts (created_at DESC);
+CREATE INDEX IF NOT EXISTS posts_updated_at_idx ON posts (updated_at);
 
 -- ============================================================
 -- TABLE 1b: research_questions (Episodic Memory – Research Agent)
@@ -125,16 +148,31 @@ CREATE TABLE IF NOT EXISTS system_config (
 
 -- ============================================================
 -- FUNCTION: cleanup_stale_drafts()
--- Auto-rejects any PENDING drafts older than 24 hours.
--- Should be scheduled via pg_cron or called by a GitHub Action.
+-- Resolves drafts that never reached a terminal state:
+--   - PENDING drafts older than 24 hours (never approved)          → REJECTED
+--   - PARTIAL_FAILURE drafts older than 24 hours (approval was
+--     given but a platform outage was never resolved)              → REJECTED
+--   - PUBLISHING rows whose claim never completed (webhook crash /
+--     timeout). updated_at is set by the webhook at claim time, so a row
+--     still PUBLISHING after 15 minutes is safely a dead claim (the publish
+--     flow touches the DB within seconds). It is reverted to PENDING so the
+--     next ✅ Approve tap reclaims it and publishes ONLY the missing
+--     platforms (idempotent – nothing already PUBLISHED is re-published).
+-- Should be scheduled via pg_cron (below) or called by a GitHub Action.
 -- ============================================================
 CREATE OR REPLACE FUNCTION cleanup_stale_drafts()
 RETURNS void AS $$
 BEGIN
     UPDATE posts
-    SET    status = 'REJECTED'
-    WHERE  status = 'PENDING'
+    SET    status = 'REJECTED', updated_at = NOW()
+    WHERE  status IN ('PENDING', 'PARTIAL_FAILURE')
     AND    created_at < NOW() - INTERVAL '24 hours';
+
+    -- Recover claims that never resolved (dead webhook instance).
+    UPDATE posts
+    SET    status = 'PENDING', updated_at = NOW()
+    WHERE  status = 'PUBLISHING'
+    AND    updated_at < NOW() - INTERVAL '15 minutes';
 
     RAISE NOTICE 'Stale draft cleanup completed at %', NOW();
 END;
@@ -142,11 +180,12 @@ $$ LANGUAGE plpgsql;
 
 -- ============================================================
 -- pg_cron Schedule (uncomment if pg_cron extension is enabled)
--- Runs cleanup_stale_drafts() every hour.
+-- Runs cleanup_stale_drafts() hourly so staleness windows are enforced
+-- promptly (24h reject, 15min PUBLISHING recovery).
 -- ============================================================
 SELECT cron.schedule(
     'cleanup-stale-drafts',     -- job name
-    '0 0 * * 0',                -- cron expression: once a week (Sunday at midnight)
+    '0 * * * *',                -- hourly at the top of the hour
     'SELECT cleanup_stale_drafts();'
 );
 

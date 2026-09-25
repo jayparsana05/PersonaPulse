@@ -77,6 +77,7 @@ class RunSelectionTest(unittest.TestCase):
         with patch("src.agent.discover_topic_candidates") as discover, \
              patch("src.agent.select_topic", return_value=selection) as select, \
              patch("src.agent.frame_question", return_value=question) as frame, \
+             patch("src.agent.get_normalized_embedding", return_value=[0.1, 0.2]), \
              patch("src.agent.store_research_question", return_value="qid-1") as store:
             result = run_selection(query="agentic AI", limit=5, candidates=topics)
 
@@ -87,7 +88,7 @@ class RunSelectionTest(unittest.TestCase):
         self.assertEqual(result["selection"], selection)
         self.assertEqual(result["research_question"], question)
         self.assertEqual(result["research_question_id"], "qid-1")
-        store.assert_called_once_with(question)
+        store.assert_called_once_with(question, embedding=[0.1, 0.2])
 
     def test_discovers_candidates_when_none_provided(self):
         topics = [candidate()]
@@ -95,6 +96,7 @@ class RunSelectionTest(unittest.TestCase):
         with patch("src.agent.discover_topic_candidates", return_value=topics) as discover, \
              patch("src.agent.select_topic", return_value=selection), \
              patch("src.agent.frame_question", return_value=question_for(topics[0])), \
+             patch("src.agent.get_normalized_embedding", return_value=[0.1, 0.2]), \
              patch("src.agent.store_research_question", return_value="qid-2") as store:
             result = run_selection(query="agentic AI", limit=5)
 
@@ -138,6 +140,7 @@ class RunSelectionTest(unittest.TestCase):
         with patch("src.agent.discover_topic_candidates", return_value=topics), \
              patch("src.agent.select_topic", return_value=selection), \
              patch("src.agent.frame_question", return_value=question), \
+             patch("src.agent.get_normalized_embedding", return_value=[0.1, 0.2]), \
              patch("src.agent.store_research_question", side_effect=RuntimeError("db down")) as store:
             result = run_selection(query="agentic AI", limit=5, candidates=topics)
 
@@ -163,6 +166,7 @@ class RunSelectionResearchMemoryTest(unittest.TestCase):
              patch("src.agent.select_topic", return_value=selection), \
              patch("src.agent.frame_question", return_value=question), \
              patch("src.agent.check_topic_researched", return_value=dup_response) as check, \
+             patch("src.agent.get_normalized_embedding", return_value=[0.1, 0.2]), \
              patch("src.agent.store_research_question", return_value=store_id) as store:
             result = run_selection(query="agentic AI", limit=5, candidates=topics, check_researched=True)
         return result, check, store

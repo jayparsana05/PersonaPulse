@@ -10,13 +10,21 @@
  * 
  * Workflow
  * --------
- *   approve_<post_id>  →  Fetch draft from Supabase
- *                      →  Publish to LinkedIn + X in parallel (Promise.allSettled)
+ *   approve_<post_id>  →  Atomic claim: conditional UPDATE
+ *                         status IN (PENDING, PARTIAL_FAILURE) → PUBLISHING.
+ *                         If no row matches (double tap / concurrent retry),
+ *                         bail out – a draft is never published twice.
+ *                      →  Publish ONLY platforms whose per-platform status
+ *                         is not yet PUBLISHED (idempotent retry).
  *                      →  Every fetch() wrapped in AbortSignal.timeout(8000)
- *                      →  Update Supabase status: PUBLISHED | PARTIAL_FAILURE
+ *                      →  Persist per-platform status + post id
+ *                      →  Final status: PUBLISHED | PARTIAL_FAILURE |
+ *                         PENDING (revert on total failure – approve retries)
  *                      →  Edit Telegram message with execution report
+ *                      →  Keyboards stay attached unless fully PUBLISHED
+ *                         so the missing platform(s) can be retried.
  *
- *   reject_<post_id>   →  Update Supabase status: REJECTED
+ *   reject_<post_id>   →  Atomic conditional UPDATE (only while PENDING)
  *                      →  Edit Telegram message: "❌ Post Rejected"
  *
  * Environment Variables (set in Supabase Dashboard → Edge Functions → Secrets)
@@ -36,6 +44,22 @@
  */
 
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  buildAuthorizationHeader,
+  buildOAuthSignature,
+  generateNonce,
+} from "./oauth.ts";
+import {
+  PLATFORMS,
+  applyAttemptOutcomes,
+  isAmbiguousPlatformError,
+  normalizeStatus,
+  selectPublishTargets,
+  type AttemptResult,
+  type FinalStatus,
+  type PlatformName,
+  type PlatformState,
+} from "./publish_logic.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -76,12 +100,14 @@ interface PostRow {
   content: string;
   platform: string;
   status: string;
+  linkedin_status?: string;
+  x_status?: string;
+  linkedin_post_id?: string | null;
+  x_post_id?: string | null;
 }
 
-interface PublishResult {
-  platform: string;
-  success: boolean;
-  error?: string;
+interface ReplyKeyboard {
+  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,19 +116,26 @@ interface PublishResult {
 
 const FETCH_TIMEOUT_MS = 8_000;  // AbortSignal.timeout cap per spec
 
-const env = {
-  supabaseUrl: Deno.env.get("SUPABASE_URL")!,
-  supabaseKey: Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-  telegramBotToken: Deno.env.get("TELEGRAM_BOT_TOKEN")!,
-  telegramChatId: Deno.env.get("TELEGRAM_CHAT_ID"),
-  telegramWebhookSecret: Deno.env.get("TELEGRAM_WEBHOOK_SECRET"),
-  linkedinAccessToken: Deno.env.get("LINKEDIN_ACCESS_TOKEN")!,
-  linkedinAuthorUrn: Deno.env.get("LINKEDIN_AUTHOR_URN")!,
-  xApiKey: Deno.env.get("X_API_KEY")!,
-  xApiSecret: Deno.env.get("X_API_SECRET")!,
-  xAccessToken: Deno.env.get("X_ACCESS_TOKEN")!,
-  xAccessSecret: Deno.env.get("X_ACCESS_SECRET")!,
-};
+/**
+ * Reads environment secrets lazily, at the point of use. Keeps module load
+ * side-effect free (importable for tests without env permissions) with no
+ * runtime behavior change.
+ */
+function readEnv() {
+  return {
+    supabaseUrl: Deno.env.get("SUPABASE_URL")!,
+    supabaseKey: Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    telegramBotToken: Deno.env.get("TELEGRAM_BOT_TOKEN")!,
+    telegramChatId: Deno.env.get("TELEGRAM_CHAT_ID"),
+    telegramWebhookSecret: Deno.env.get("TELEGRAM_WEBHOOK_SECRET"),
+    linkedinAccessToken: Deno.env.get("LINKEDIN_ACCESS_TOKEN")!,
+    linkedinAuthorUrn: Deno.env.get("LINKEDIN_AUTHOR_URN")!,
+    xApiKey: Deno.env.get("X_API_KEY")!,
+    xApiSecret: Deno.env.get("X_API_SECRET")!,
+    xAccessToken: Deno.env.get("X_ACCESS_TOKEN")!,
+    xAccessSecret: Deno.env.get("X_ACCESS_SECRET")!,
+  };
+}
 
 /**
  * Derives a valid Telegram secret token [a-zA-Z0-9_-]{1,256} from the bot token.
@@ -176,7 +209,8 @@ function extractChatId(update: TelegramUpdate): string | null {
 // Main Handler
 // ---------------------------------------------------------------------------
 
-Deno.serve(async (req: Request): Promise<Response> => {
+if (import.meta.main) {
+  Deno.serve(async (req: Request): Promise<Response> => {
   // ── Layer 1: Secret Token Header Check ────────────────────────────────────
   // Read X-Telegram-Bot-Api-Secret-Token from incoming request before doing anything else
   const secretHeader = req.headers.get("X-Telegram-Bot-Api-Secret-Token");
@@ -226,6 +260,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   const chatId = Number(message.chat.id);
   const messageId = message.message_id;
 
+  const env = readEnv();
   const supabase = createClient(env.supabaseUrl, env.supabaseKey);
 
   // ── Answer the callback query immediately (removes Telegram spinner) ─
@@ -245,7 +280,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   return new Response("OK", { status: 200 });
-});
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Reject Handler
@@ -259,10 +295,26 @@ async function handleReject(
 ): Promise<void> {
   console.log(`[Webhook] Rejecting post: ${postId}`);
 
-  await supabase
+  // Only a draft still awaiting approval (PENDING) can be rejected. A
+  // conditional UPDATE is atomic: if the row has been claimed or already
+  // published (PUBLISHING / PUBLISHED / PARTIAL_FAILURE / REJECTED), no row
+  // matches and the rejection is a no-op.
+  const { data: rejected, error } = await supabase
     .from("posts")
-    .update({ status: "REJECTED" })
-    .eq("id", postId);
+    .update({ status: "REJECTED", updated_at: nowIso() })
+    .eq("id", postId)
+    .eq("status", "PENDING")
+    .select("id")
+    .maybeSingle();
+
+  if (error || !rejected) {
+    await editTelegramMessage(
+      chatId,
+      messageId,
+      `⚠️ Draft \`${postId}\` could not be rejected: it is no longer awaiting approval.\n_It may already be processing or partially published – tap ✅ Approve & Publish to retry._`,
+    );
+    return;
+  }
 
   await editTelegramMessage(
     chatId,
@@ -283,63 +335,154 @@ async function handleApprove(
 ): Promise<void> {
   console.log(`[Webhook] Approving post: ${postId}`);
 
-  // ── Fetch the pending draft from Supabase ────────────────────────────
-  const { data: rows, error } = await supabase
+  // ── Atomic claim ─────────────────────────────────────────────────────
+  // A conditional UPDATE claims the draft for THIS approval event only
+  // (status IN (PENDING, PARTIAL_FAILURE) → PUBLISHING). If another event
+  // already claimed it (double tap, concurrent webhook, or a retry racing
+  // ahead), no row matches the WHERE clause and we bail out – so a draft is
+  // never published (or re-published) twice. updated_at lets the scheduled
+  // cleanup recover rows whose claim never resolved (see schema.sql).
+  const { data: claimed, error: claimError } = await supabase
     .from("posts")
-    .select("id, content, platform, status")
+    .update({ status: "PUBLISHING", updated_at: nowIso() })
     .eq("id", postId)
-    .eq("status", "PENDING")
-    .limit(1);
+    .in("status", ["PENDING", "PARTIAL_FAILURE"])
+    .select("id, content, platform, linkedin_status, x_status, linkedin_post_id, x_post_id")
+    .maybeSingle();
 
-  if (error || !rows || rows.length === 0) {
-    console.error("[Webhook] Failed to fetch post:", error);
+  if (claimError || !claimed) {
+    console.error(
+      "[Webhook] Could not claim draft for publishing:",
+      claimError ?? `no row in claimable state (id=${postId})`,
+    );
+    await explainClaimFailure(supabase, postId, chatId, messageId);
+    return;
+  }
+
+  const post = claimed as PostRow;
+
+  // Parse platform-specific drafts from combined content field.
+  const { linkedinText, xText } = parseDraftContent(post.content);
+
+  // ‒ Publish ONLY platforms that are SAFE to (re)attempt ───────────────
+  // selectPublishTargets publishes a platform only when its per-platform
+  // status is PENDING (never attempted) or FAILED (definitively rejected).
+  // PUBLISHED → already done; PUBLISHING → an in-flight / unconfirmed attempt
+  // from this or an earlier claim, and it is NEVER auto-republished. That is
+  // what prevents a duplicate post when a stale PUBLISHING record is
+  // recovered (cleanup reverts top-level PUBLISHING → PENDING, but a platform
+  // the previous claim was publishing is now left PUBLISHING and skipped) or
+  // when the process dies between the external publish and the durable record.
+  const attempted: AttemptResult[] = await Promise.all(
+    selectPublishTargets({ linkedin: post.linkedin_status, x: post.x_status }).map(
+      (platform) => publishAndRecord(
+        supabase,
+        postId,
+        platform,
+        () => platform === "LinkedIn"
+          ? publishToLinkedIn(linkedinText)
+          : publishToX(xText),
+      ),
+    ),
+  );
+
+  // ── Determine final status from the durable per-platform statuses ────
+  // Never derived from in-memory results alone — the same outcome must hold
+  // no matter which claim (first attempt, partial retry, or recovery) ran.
+  const { finalStates, finalStatus } = applyAttemptOutcomes(
+    { linkedin: post.linkedin_status, x: post.x_status },
+    attempted,
+  );
+
+  // ── Final top-level status MUST be durable before any success is reported ──
+  // If this write fails the row is left claiming (PUBLISHING) while isolated
+  // per-platform records may already be PUBLISHED — an inconsistent database.
+  // Never report that as a clean success: surface the failure, best-effort
+  // revert the row to PENDING so a retry settles it from the durable per-
+  // platform statuses (cleanup_stale_drafts is the scheduled fallback).
+  try {
+    await persistFinalStatus(supabase, postId, finalStatus);
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[Webhook] Final status persistence failed for ${postId}:`, errorMsg);
+    const { error: settleErr } = await supabase
+      .from("posts")
+      .update({ status: "PENDING", updated_at: nowIso() })
+      .eq("id", postId);
+    if (settleErr) {
+      console.error(
+        `[Webhook] Could not revert ${postId} to PENDING for retry; awaiting cleanup:`,
+        settleErr.message,
+      );
+    }
     await editTelegramMessage(
-      chatId, messageId,
-      `⚠️ *Error*: Could not find PENDING draft \`${postId}\`.\nIt may have already been processed.`,
+      chatId,
+      messageId,
+      `⚠️ *Publishing could not be recorded*\n\nDraft \`${postId}\` was processed but its final status could not be saved to the database.\n_Check the logs. Tap ✅ Approve & Publish to retry._`,
+      buildInlineKeyboard(postId),
     );
     return;
   }
 
-  const post = rows[0] as PostRow;
-
-  // Parse platform-specific drafts from combined content field
-  const { linkedinText, xText } = parseDraftContent(post.content);
-
-  // ── Publish to both platforms in parallel ────────────────────────────
-  const [linkedinResult, xResult] = await Promise.allSettled([
-    publishToLinkedIn(linkedinText),
-    publishToX(xText),
-  ]);
-
-  const results: PublishResult[] = [
-    evaluateSettled(linkedinResult, "LinkedIn"),
-    evaluateSettled(xResult, "X (Twitter)"),
-  ];
-
-  // ── Determine final status ───────────────────────────────────────────
-  const allSuccess = results.every((r) => r.success);
-  const anySuccess = results.some((r) => r.success);
-  const finalStatus = allSuccess ? "PUBLISHED"
-    : anySuccess ? "PARTIAL_FAILURE"
-      : "PARTIAL_FAILURE";
-
-  await supabase
-    .from("posts")
-    .update({ status: finalStatus })
-    .eq("id", postId);
-
   // ── Build and send execution report ─────────────────────────────────
-  const report = buildExecutionReport(postId, results, finalStatus);
-  await editTelegramMessage(chatId, messageId, report);
+  const report = buildExecutionReport(postId, post, attempted, finalStates, finalStatus);
+  const fullyPublished = finalStatus === "PUBLISHED";
+  await editTelegramMessage(
+    chatId,
+    messageId,
+    report,
+    fullyPublished ? undefined : buildInlineKeyboard(postId),
+  );
 
-  console.log(`[Webhook] Post ${postId} → ${finalStatus}`);
+  console.log(`[Webhook] Post ${postId} → ${finalStatus} (per-platform ${JSON.stringify(finalStates)})`);
+}
+
+/**
+ * Explains why an approve tap could not claim the draft, distinguishing an
+ * in-flight publish (keep the buttons, suggest waiting) from a resolved post
+ * (remove the buttons – there is nothing left to approve).
+ */
+async function explainClaimFailure(
+  supabase: SupabaseClient,
+  postId: string,
+  chatId: number,
+  messageId: number,
+): Promise<void> {
+  let rowStatus: string | null = null;
+  try {
+    const { data: statusRow } = await supabase
+      .from("posts")
+      .select("status")
+      .eq("id", postId)
+      .maybeSingle();
+    rowStatus = statusRow?.status ?? null;
+  } catch {
+    rowStatus = null;
+  }
+
+  if (rowStatus === "PUBLISHING") {
+    await editTelegramMessage(
+      chatId,
+      messageId,
+      `⏳ *Still publishing*\n\nDraft \`${postId}\` is currently being published.\n_No duplicate was created – wait a few minutes, then tap ✅ to retry if it stays stuck._`,
+      buildInlineKeyboard(postId),
+    );
+    return;
+  }
+
+  await editTelegramMessage(
+    chatId,
+    messageId,
+    `⚠️ *Already ${rowStatus ?? "processed"}*\n\nDraft \`${postId}\` could not be claimed for publishing.\n_No content was published or re-published._`,
+  );
 }
 
 // ---------------------------------------------------------------------------
 // LinkedIn Publisher (Edge Function version)
 // ---------------------------------------------------------------------------
 
-async function publishToLinkedIn(text: string): Promise<void> {
+async function publishToLinkedIn(text: string): Promise<string | null> {
+  const env = readEnv();
   const payload = {
     author: env.linkedinAuthorUrn,
     lifecycleState: "PUBLISHED",
@@ -369,18 +512,24 @@ async function publishToLinkedIn(text: string): Promise<void> {
     const body = await resp.text();
     throw new Error(`LinkedIn API ${resp.status}: ${body.slice(0, 300)}`);
   }
+
+  // LinkedIn identifies the created post in the `x-restli-id` RESPONSE HEADER
+  // as a URN (e.g. urn:li:ugcPost:68447855235931240). Persist the returned
+  // value for per-platform deduplication.
+  return resp.headers.get("x-restli-id");
 }
 
 // ---------------------------------------------------------------------------
 // X (Twitter) Publisher – OAuth 1.0a (HMAC-SHA1)
 // ---------------------------------------------------------------------------
 
-async function publishToX(text: string): Promise<void> {
+async function publishToX(text: string): Promise<string | null> {
   /**
    * X API v2 requires OAuth 1.0a for write operations.
    * This implementation manually signs the request using Web Crypto API
    * (available in Deno / Supabase Edge Runtime).
    */
+  const env = readEnv();
   const url = "https://api.twitter.com/2/tweets";
   const method = "POST";
 
@@ -393,12 +542,17 @@ async function publishToX(text: string): Promise<void> {
     oauth_version: "1.0",
   };
 
-  const signature = await buildOAuthSignature(method, url, oauthParams, {});
+  const signature = await buildOAuthSignature(
+    method,
+    url,
+    oauthParams,
+    {},
+    env.xApiSecret,
+    env.xAccessSecret,
+  );
   oauthParams["oauth_signature"] = signature;
 
-  const authHeader = "OAuth " + Object.entries(oauthParams)
-    .map(([k, v]) => `${encodeURIComponent(k)}="${encodeURIComponent(v)}"`)
-    .join(", ");
+  const authHeader = buildAuthorizationHeader(oauthParams);
 
   const resp = await fetch(url, {
     method: "POST",
@@ -414,43 +568,21 @@ async function publishToX(text: string): Promise<void> {
     const body = await resp.text();
     throw new Error(`X API ${resp.status}: ${body.slice(0, 300)}`);
   }
+
+  // X returns the new tweet id as data.id → persisted for deduplication.
+  const data = await resp.json();
+  const tweetId = data?.data?.id;
+  return typeof tweetId === "string" ? tweetId : null;
 }
 
 // ---------------------------------------------------------------------------
-// OAuth 1.0a Signing Helpers (Web Crypto / Deno-compatible)
+// OAuth 1.0a Signing – see ./oauth.ts
 // ---------------------------------------------------------------------------
+// percentEncode / buildOAuthSignature / buildAuthorizationHeader are shared
+// and unit-tested in oauth.ts (RFC 3986 encoding). They are imported above.
 
-function generateNonce(): string {
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  return btoa(String.fromCharCode(...bytes)).replace(/[^a-zA-Z0-9]/g, "");
-}
-
-async function buildOAuthSignature(
-  method: string,
-  url: string,
-  oauthParams: Record<string, string>,
-  bodyParams: Record<string, string>,
-): Promise<string> {
-  const allParams = { ...oauthParams, ...bodyParams };
-  const sortedKeys = Object.keys(allParams).sort();
-  const paramString = sortedKeys
-    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(allParams[k])}`)
-    .join("&");
-
-  const baseString = [
-    method.toUpperCase(),
-    encodeURIComponent(url),
-    encodeURIComponent(paramString),
-  ].join("&");
-
-  const signingKey = `${encodeURIComponent(env.xApiSecret)}&${encodeURIComponent(env.xAccessSecret)}`;
-
-  const keyData = new TextEncoder().encode(signingKey);
-  const msgData = new TextEncoder().encode(baseString);
-  const cryptoKey = await crypto.subtle.importKey("raw", keyData, { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
-  const signatureBuffer = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
-  return btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)));
+function nowIso(): string {
+  return new Date().toISOString();
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +590,7 @@ async function buildOAuthSignature(
 // ---------------------------------------------------------------------------
 
 async function answerCallbackQuery(callbackQueryId: string): Promise<void> {
+  const env = readEnv();
   await fetch(
     `https://api.telegram.org/bot${env.telegramBotToken}/answerCallbackQuery`,
     {
@@ -473,7 +606,9 @@ async function editTelegramMessage(
   chatId: number,
   messageId: number,
   text: string,
+  keyboard?: ReplyKeyboard,
 ): Promise<void> {
+  const env = readEnv();
   await fetch(
     `https://api.telegram.org/bot${env.telegramBotToken}/editMessageText`,
     {
@@ -484,7 +619,8 @@ async function editTelegramMessage(
         message_id: messageId,
         text: text.slice(0, 4096),
         parse_mode: "Markdown",
-        reply_markup: { inline_keyboard: [] },  // remove buttons after action
+        // keep inline buttons for retry, or remove them once fully resolved
+        reply_markup: keyboard ?? { inline_keyboard: [] },
       }),
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     },
@@ -506,37 +642,184 @@ function parseDraftContent(content: string): { linkedinText: string; xText: stri
   return { linkedinText: linkedin, xText: x };
 }
 
-function evaluateSettled(
-  result: PromiseSettledResult<void>,
-  platform: string,
-): PublishResult {
-  if (result.status === "fulfilled") {
-    return { platform, success: true };
+/**
+ * Publishes ONE platform and records its outcome, with a write-ahead marker:
+ *
+ *   1. durably set `<platform>_status = PUBLISHING` BEFORE the external call,
+ *   2. call the platform,
+ *   3. durably set PUBLISHED (+ post id) or FAILED as soon as the call resolves.
+ *
+ * If the process dies between any two steps, the per-platform status is left
+ * PUBLISHING (unconfirmed). Because selectPublishTargets NEVER auto-republishes
+ * a PUBLISHING platform, a recovery/retry cannot create a duplicate post —
+ * the unavoidable at-most-once gap is replaced by "unconfirmed, wait for
+ * manual verification", which is the safest legal outcome for an external API
+ * with no request-idempotency keys.
+ */
+export async function publishAndRecord(
+  supabase: SupabaseClient,
+  postId: string,
+  platform: PlatformName,
+  run: () => Promise<string | null>,
+): Promise<AttemptResult> {
+  const column = platform === "LinkedIn" ? "linkedin" : "x";
+
+  // ── Step 1: write-ahead in-flight marker (durable BEFORE side effects) ──
+  try {
+    await recordPerPlatformStatus(supabase, postId, column, "PUBLISHING", null);
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[Webhook] Could not mark ${platform} publish intent:`, errorMsg);
+    return { platform, success: false, error: `could not record publish intent: ${errorMsg}` };
   }
-  const errorMsg = result.reason instanceof Error
-    ? result.reason.message
-    : String(result.reason);
-  console.error(`[Webhook] ${platform} publish failed:`, errorMsg);
-  return { platform, success: false, error: errorMsg };
+
+  // ── Step 2: external publish ─────────────────────────────────────────
+  let publishedId: string | null;
+  try {
+    publishedId = (await run()) ?? null;
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    if (isAmbiguousPlatformError(err)) {
+      // Timeout / 5xx / network: the platform MAY have accepted the request.
+      // Keep the durable PUBLISHING marker (unconfirmed) — never auto-retry.
+      console.error(`[Webhook] ${platform} publish outcome UNCONFIRMED:`, errorMsg);
+      return {
+        platform,
+        success: false,
+        unconfirmed: true,
+        error: `outcome unconfirmed (may have posted): ${errorMsg}`,
+      };
+    }
+    // Definitive rejection (HTTP 4xx – invalid auth/payload): record FAILED,
+    // which makes the platform safely retryable.
+    console.error(`[Webhook] ${platform} publish failed:`, errorMsg);
+    try {
+      await recordPerPlatformStatus(supabase, postId, column, "FAILED", null);
+    } catch (recordErr) {
+      console.error(`[Webhook] Could not record ${platform} failure:`, recordErr);
+    }
+    return { platform, success: false, error: errorMsg };
+  }
+
+  // ── Step 3: durable record of the confirmed post ─────────────────────
+  try {
+    await recordPerPlatformStatus(supabase, postId, column, "PUBLISHED", publishedId);
+    return { platform, success: true, post_id: publishedId };
+  } catch (err) {
+    // The post IS live but its record failed; the per-platform status remains
+    // 'PUBLISHING' from step 1 — unconfirmed, so a recovery never republishes
+    // it (that would duplicate the live post).
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[Webhook] ${platform} was published (${publishedId}) but its record failed:`,
+      errorMsg,
+    );
+    return {
+      platform,
+      success: false,
+      unconfirmed: true,
+      post_id: publishedId,
+      error: `published (${publishedId ?? "n/a"}) but record failed: ${errorMsg}`,
+    };
+  }
+}
+
+export async function recordPerPlatformStatus(
+  supabase: SupabaseClient,
+  postId: string,
+  column: "linkedin" | "x",
+  status: "PUBLISHING" | "PUBLISHED" | "FAILED",
+  platformPostId: string | null,
+): Promise<void> {
+  // The Supabase client does NOT throw on response errors — inspect them, or a
+  // failed per-platform write would be swallowed and the publish reported as a
+  // clean success against a database that never recorded it.
+  const { error } = await supabase
+    .from("posts")
+    .update({
+      [`${column}_status`]: status,
+      [`${column}_post_id`]: platformPostId,
+      updated_at: nowIso(),
+    } as Record<string, unknown>)
+    .eq("id", postId);
+  if (error) {
+    throw new Error(
+      `could not persist ${column} status '${status}' for post ${postId}: ${error.message}`,
+    );
+  }
+}
+
+/**
+ * Persists the final top-level post status. Captures and checks the Supabase
+ * response so a failed write surfaces (thrown up to handleApprove) instead of
+ * silently claiming success while the database is left inconsistent.
+ */
+export async function persistFinalStatus(
+  supabase: SupabaseClient,
+  postId: string,
+  status: FinalStatus,
+): Promise<void> {
+  const { error } = await supabase
+    .from("posts")
+    .update({ status, updated_at: nowIso() })
+    .eq("id", postId);
+  if (error) {
+    throw new Error(
+      `could not persist final status '${status}' for post ${postId}: ${error.message}`,
+    );
+  }
+}
+
+function buildInlineKeyboard(postId: string): ReplyKeyboard {
+  return {
+    inline_keyboard: [
+      [
+        { text: "✅ Approve & Publish", callback_data: `approve_${postId}` },
+        { text: "❌ Reject", callback_data: `reject_${postId}` },
+      ],
+    ],
+  };
 }
 
 function buildExecutionReport(
   postId: string,
-  results: PublishResult[],
-  finalStatus: string,
+  post: PostRow,
+  attempted: AttemptResult[],
+  finalStates: PlatformState,
+  finalStatus: FinalStatus,
 ): string {
   const statusEmoji = finalStatus === "PUBLISHED" ? "✅" : "⚠️";
   const statusLabel = finalStatus === "PUBLISHED"
     ? "Successfully Published"
-    : "Partial Failure – check logs";
+    : finalStatus === "PARTIAL_FAILURE"
+      ? "Partial Failure"
+      : finalStatus === "PENDING" && attempted.some((r) => r.unconfirmed)
+        ? "Published Unconfirmed"
+        : "Publishing Failed";
 
-  const lines = results.map((r) =>
-    r.success
-      ? `  ✅ *${r.platform}*: Published`
-      : `  ❌ *${r.platform}*: Failed\n      \`${(r.error ?? "").slice(0, 120)}\``
-  );
+  const attemptedById = new Map(attempted.map((r) => [r.platform, r]));
+  const lineFor = (platform: PlatformName): string => {
+    const status = normalizeStatus(finalStates[platform === "LinkedIn" ? "linkedin" : "x"]);
+    const attempt = attemptedById.get(platform);
+    const storedId = platform === "LinkedIn"
+      ? post.linkedin_post_id
+      : post.x_post_id;
+    const ref = attempt?.post_id ?? storedId ?? undefined;
+    if (status === "PUBLISHED") {
+      return `  ✅ *${platform}*: Published${ref ? ` (\`${ref}\`)` : ""}`;
+    }
+    if (status === "PUBLISHING") {
+      // Unconfirmed: the post may be live (crashed after publish, or a failed
+      // record write). We surfaced it loudly and never auto-republish it —
+      // that would duplicate the post.
+      return `  ⚠️ *${platform}*: Post may have gone out (cannot confirm)${ref ? ` (\`${ref}\`)` : ""}\n      _Verify manually — not auto-retried (would duplicate)._`;
+    }
+    return `  ❌ *${platform}*: Failed\n      \`${(attempt?.error ?? "").slice(0, 120)}\``;
+  };
 
-  return [
+  const lines = PLATFORMS.map(lineFor);
+
+  const sections = [
     `${statusEmoji} *${statusLabel}*`,
     "",
     `🆔 Draft ID: \`${postId}\``,
@@ -545,5 +828,11 @@ function buildExecutionReport(
     ...lines,
     "",
     `_Status: ${finalStatus}_`,
-  ].join("\n");
+  ];
+
+  if (finalStatus !== "PUBLISHED") {
+    sections.push("", "_Tap ✅ Approve & Publish to retry the missing platform(s)._");
+  }
+
+  return sections.join("\n");
 }
