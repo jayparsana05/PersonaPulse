@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 # Dummy env vars (see tests/test_ingestion_discovery.py) so src.config
@@ -35,6 +36,7 @@ for _key, _value in _REQUIRED_ENV.items():
     os.environ.setdefault(_key, _value)
 
 from src.memory import (  # noqa: E402
+    _canonical_url,
     check_topic_researched,
     delete_research_question,
     filter_repeated_sources,
@@ -235,6 +237,18 @@ class StoreResearchSourcesTest(unittest.TestCase):
         self.assertEqual(row["source_type"], ResearchSource.SOURCE_TYPE_SECONDARY)
         self.assertIsNotNone(row["accessed_at"])
 
+    def test_row_records_the_canonical_url_fingerprint(self):
+        self._store(
+            [ResearchSource(url="https://www.Example.com/a/?utm_source=rss#top",
+                            title="T", body="B")]
+        )
+        self.assertEqual(self.fake_client.rows[0]["canonical_url"], "https://example.com/a")
+
+    def test_canonical_url_equals_the_dedup_fingerprint_for_plain_urls(self):
+        self._store(self._sources(2))
+        for row in self.fake_client.rows:
+            self.assertEqual(row["canonical_url"], _canonical_url(row["url"]))
+
     def test_links_each_row_to_the_question_id(self):
         self._store(self._sources(2), question_id="qid-7")
         for row in self.fake_client.rows:
@@ -287,6 +301,13 @@ class LinkResearchSourcesTest(unittest.TestCase):
         self.assertNotIn("source", row)
         self.assertNotIn("published", row)
         self.assertIsNotNone(row["accessed_at"])
+
+    def test_link_rows_record_the_canonical_url_fingerprint(self):
+        self._link([
+            ResearchSource(url="https://www.Example.com/a/?utm_source=rss#top",
+                           title="Known source", body="A body snippet."),
+        ])
+        self.assertEqual(self.fake_client.rows[0]["canonical_url"], "https://example.com/a")
 
     def test_link_rows_are_scoped_to_the_session(self):
         self._link(question_id="qid-7")
@@ -734,20 +755,22 @@ class DeleteResearchQuestionTest(unittest.TestCase):
 
 
 class FakeStatusSupabase:
-    """Chainable fake for set_research_question_status (select-then-update)."""
+    """Chainable fake for the ATOMIC set_research_question_status update.
 
-    def __init__(self, select_rows, raise_on=None):
-        self.select_rows = select_rows
+    Models the database: the UPDATE only affects a row when the session's
+    current status is within the allowed-from set passed to ``in_`` – if not,
+    zero rows are returned and the transition is rejected. No read-then-write
+    passes through a separate SELECT anymore.
+    """
+
+    def __init__(self, current_status="proposed", raise_on=None):
+        self.current_status = current_status
         self.raise_on = raise_on
         self.updated = None
+        self.filter = None
+        self.from_filter = None
 
     def table(self, name):
-        return self
-
-    def select(self, *cols):
-        return self
-
-    def limit(self, n):
         return self
 
     def update(self, row):
@@ -755,22 +778,35 @@ class FakeStatusSupabase:
         return self
 
     def eq(self, col, val):
+        self.filter = (col, val)
+        return self
+
+    def in_(self, col, values):
+        self.from_filter = (col, values)
+        return self
+
+    def select(self, *cols):
         return self
 
     def execute(self):
         if self.raise_on is not None:
             raise self.raise_on
-        if self.updated is not None:
-            return FakeResultWithData([{}])
-        return FakeResultWithData(self.select_rows)
+        if self.updated is None:
+            return FakeResultWithData([])
+        allowed = (self.from_filter or (None, ()))[1]
+        if self.current_status in allowed:
+            return FakeResultWithData([{"id": "qid-1"}])
+        return FakeResultWithData([])
 
 
 class SetResearchQuestionStatusTest(unittest.TestCase):
     """set_research_question_status enforces the research-session lifecycle
-    state machine (proposed → researching → answered/dropped)."""
+    state machine (proposed → researching → answered/dropped) as a single
+    atomic UPDATE filtered on the allowed source states. answered_at follows
+    the two-way DB invariant: stamped on 'answered', cleared on leaving it."""
 
     def _set(self, current="proposed", question_id="qid-1", status="researching", **kwargs):
-        fake = FakeStatusSupabase([{"id": question_id, "status": current}], **kwargs)
+        fake = FakeStatusSupabase(current, **kwargs)
         with patch("src.memory._get_supabase", return_value=fake):
             ok = set_research_question_status(question_id, status)
         return ok, fake
@@ -778,10 +814,42 @@ class SetResearchQuestionStatusTest(unittest.TestCase):
     def test_valid_transition_is_written_back(self):
         ok, fake = self._set(current="proposed", status="researching")
         self.assertTrue(ok)
-        self.assertEqual(fake.updated, {"status": "researching"})
+        self.assertEqual(fake.updated, {"status": "researching", "answered_at": None})
+
+    def test_transition_is_filtered_on_the_allowed_source_states(self):
+        _, fake = self._set(current="proposed", status="researching")
+        self.assertEqual(fake.filter, ("id", "qid-1"))
+        self.assertEqual(fake.from_filter, ("status", ("answered", "proposed")))
 
     def test_researching_to_answered_is_allowed(self):
-        ok, _ = self._set(current="researching", status="answered")
+        ok, fake = self._set(current="researching", status="answered")
+        self.assertTrue(ok)
+        self.assertEqual(fake.updated["status"], "answered")
+        self.assertEqual(fake.updated["answered_at"], datetime.fromisoformat(fake.updated["answered_at"]).isoformat())
+
+    def test_answered_stamps_a_current_utc_timestamp(self):
+        _, fake = self._set(current="researching", status="answered")
+        self.assertIn("answered_at", fake.updated)
+        self.assertIsNotNone(fake.updated["answered_at"])
+
+    def test_non_answered_transitions_clear_answered_at(self):
+        _, fake = self._set(current="proposed", status="researching")
+        self.assertEqual(fake.updated, {"status": "researching", "answered_at": None})
+        _, fake = self._set(current="researching", status="dropped")
+        self.assertEqual(fake.updated, {"status": "dropped", "answered_at": None})
+
+    def test_leaving_answered_for_research_clears_answered_at(self):
+        ok, fake = self._set(current="answered", status="researching")
+        self.assertTrue(ok)
+        self.assertEqual(fake.updated, {"status": "researching", "answered_at": None})
+
+    def test_leaving_answered_for_dropped_clears_answered_at(self):
+        ok, fake = self._set(current="answered", status="dropped")
+        self.assertTrue(ok)
+        self.assertEqual(fake.updated, {"status": "dropped", "answered_at": None})
+
+    def test_answered_session_can_be_reactivated_for_research(self):
+        ok, _ = self._set(current="answered", status="researching")
         self.assertTrue(ok)
 
     def test_researching_to_dropped_is_allowed(self):
@@ -789,21 +857,19 @@ class SetResearchQuestionStatusTest(unittest.TestCase):
         self.assertTrue(ok)
 
     def test_illegal_jump_proposed_to_answered_is_rejected(self):
-        ok, fake = self._set(current="proposed", status="answered")
+        ok, _ = self._set(current="proposed", status="answered")
         self.assertFalse(ok)
-        self.assertIsNone(fake.updated)
 
     def test_illegal_unknown_target_is_rejected(self):
         ok, _ = self._set(current="proposed", status="publish_ready")
         self.assertFalse(ok)
 
     def test_no_transition_out_of_dropped(self):
-        ok, fake = self._set(current="dropped", status="answered")
+        ok, _ = self._set(current="dropped", status="answered")
         self.assertFalse(ok)
-        self.assertIsNone(fake.updated)
 
     def test_unknown_session_returns_false(self):
-        fake = FakeStatusSupabase([])
+        fake = FakeStatusSupabase("__no_such_state__")
         with patch("src.memory._get_supabase", return_value=fake):
             ok = set_research_question_status("qid-missing", "answered")
         self.assertFalse(ok)

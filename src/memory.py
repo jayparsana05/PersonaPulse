@@ -89,6 +89,19 @@ def _normalize_research_text(text) -> str:
     return " ".join((text or "").split()).casefold()
 
 
+def _canonical_url(url: str) -> str:
+    """Deterministic URL fingerprint used for per-session source dedup.
+
+    Mirrors exactly the per-session dedup key the app already computes in
+    ``filter_repeated_sources``: ``_normalize_url(url)`` (lowercase host,
+    ``www.`` stripped, fragment + ``utm_*`` params dropped, trailing slash
+    normalized) with the result case-folded. Stored in
+    ``research_sources.canonical_url`` and enforced by the DB's partial
+    unique index ``research_sources_session_url_uniq``.
+    """
+    return (_normalize_url(url) or url).casefold()
+
+
 # ---------------------------------------------------------------------------
 # Public: Embedding with L2 Normalization
 # ---------------------------------------------------------------------------
@@ -275,6 +288,7 @@ def store_research_sources(
         row = {
             "research_question_id": research_question_id,
             "url": source.url,
+            "canonical_url": _canonical_url(source.url),
             "title": source.title,
             "body": source.body,
             "source": source.source,
@@ -320,6 +334,7 @@ def link_research_sources(
         row = {
             "research_question_id": research_question_id,
             "url": source.url,
+            "canonical_url": _canonical_url(source.url),
             "title": source.title,
             "score": source.score,
             "source_type": source.source_type,
@@ -683,6 +698,22 @@ _RESEARCH_LIFECYCLE_NEXT: dict[str, set] = {
     ResearchQuestion.STATUS_DROPPED: set(),
 }
 
+# Inverted state machine: the set of source states from which a target status
+# may be entered legally. Used to filter the atomic state-transition UPDATE so
+# the database (not a read-then-write race) enforces the lifecycle.
+_RESEARCH_STATUS_FROM: dict[str, tuple[str, ...]] = {
+    target: tuple(sorted(
+        source for source, targets in _RESEARCH_LIFECYCLE_NEXT.items()
+        if target in targets
+    ))
+    for target in (
+        ResearchQuestion.STATUS_PROPOSED,
+        ResearchQuestion.STATUS_RESEARCHING,
+        ResearchQuestion.STATUS_ANSWERED,
+        ResearchQuestion.STATUS_DROPPED,
+    )
+}
+
 
 def set_research_question_status(
     research_question_id: Optional[str],
@@ -692,15 +723,24 @@ def set_research_question_status(
     Best-effort lifecycle transition for a research session.
 
     Applies the explicit state machine defined by
-    ``ResearchQuestion.STATUS_*`` / ``_RESEARCH_LIFECYCLE_NEXT``: the current
-    status is read, an illegal transition (e.g. ``answered`` → ``proposed`` or
-    any move out of ``dropped``) is rejected with only a log line, and a
-    valid transition is written back to the ``research_questions`` row.
+    ``ResearchQuestion.STATUS_*`` / ``_RESEARCH_LIFECYCLE_NEXT`` as a single
+    ATOMIC update: ``UPDATE ... SET status = <target> WHERE id = <session>
+    AND status IN <allowed-from-states>``. Because the allowed source states
+    are part of the WHERE clause, the transition is validated by the database
+    in one round trip – there is no read-then-write window in which a second
+    writer could race the transition (e.g. two runs finalizing the same
+    session).
+
+    ``answered_at`` is kept consistent with the two-way DB invariant
+    ``research_questions_answered_at_check``: moving a session to
+    ``answered`` stamps ``answered_at`` with the current UTC timestamp, and
+    leaving ``answered`` (re-research / dropped) clears it so every
+    non-answered row has ``answered_at IS NULL``.
 
     Never raises and never halts the pipeline: an unavailable store or a
-    missing session row only logs a warning and returns False (the caller
-    keeps its in-memory result intact). Returns True only when the transition
-    was both valid and issued.
+    session that does not match the transition only logs and returns False
+    (the caller keeps its in-memory result intact). Returns True only when a
+    row was actually updated.
     """
     if not research_question_id or not status:
         return False
@@ -708,41 +748,28 @@ def set_research_question_status(
         log.warning("[Memory] Unknown research-question status '%s' – ignoring.", status)
         return False
 
+    allowed_from = _RESEARCH_STATUS_FROM.get(status, ())
+    if not allowed_from:
+        log.warning(
+            "[Memory] Research-question status '%s' cannot be entered from any state – ignoring.",
+            status,
+        )
+        return False
+
+    updates: dict = {"status": status, "answered_at": None}
+    if status == ResearchQuestion.STATUS_ANSWERED:
+        updates["answered_at"] = datetime.now(timezone.utc).isoformat()
+
     try:
         supabase = _get_supabase()
         result = (
             supabase.table("research_questions")
-            .select("status")
+            .update(updates)
             .eq("id", research_question_id)
-            .limit(1)
+            .in_("status", allowed_from)
+            .select("id")
             .execute()
         )
-    except Exception as exc:  # pylint: disable=broad-except
-        log.warning(
-            "[Memory] Could not read research session %s status (%s: %s) – skipping transition.",
-            research_question_id, type(exc).__name__, exc,
-        )
-        return False
-
-    rows = list(result.data or [])
-    if not rows:
-        log.warning(
-            "[Memory] No research session %s – skipping status transition.",
-            research_question_id,
-        )
-        return False
-
-    current = str(rows[0].get("status") or ResearchQuestion.STATUS_PROPOSED)
-    allowed = _RESEARCH_LIFECYCLE_NEXT.get(current, set())
-    if status not in allowed:
-        log.info(
-            "[Memory] Skipping invalid research-session transition %s → %s for %s.",
-            current, status, research_question_id,
-        )
-        return False
-
-    try:
-        supabase.table("research_questions").update({"status": status}).eq("id", research_question_id).execute()
     except Exception as exc:  # pylint: disable=broad-except
         log.warning(
             "[Memory] Could not update research session %s to %s (%s: %s).",
@@ -750,7 +777,15 @@ def set_research_question_status(
         )
         return False
 
-    log.info("[Memory] Research session %s: status=%s → %s", research_question_id, current, status)
+    rows = list(getattr(result, "data", None) or [])
+    if not rows:
+        log.info(
+            "[Memory] No research session %s transitioned to %s (row missing, or state not in %s).",
+            research_question_id, status, allowed_from,
+        )
+        return False
+
+    log.info("[Memory] Research session %s: → status=%s", research_question_id, status)
     return True
 
 
