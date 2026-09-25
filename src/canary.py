@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import sys
 
-from src.llm import send_telegram_text
+from src.llm import send_telegram_markdown
 from src.publishers import check_linkedin_token_health
 
 log = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ def run_canary_check() -> bool:
             "➡️ Renew at: https://www.linkedin.com/developers/apps\n"
             "_PersonaPulse pipeline halted._"
         )
-        send_telegram_text(message)
+        send_telegram_markdown(message)
         log.error("[Canary] Token expired – pipeline halted.")
         return False
 
@@ -54,10 +54,9 @@ def run_canary_check() -> bool:
             "Please renew it before it expires to avoid disruption.\n\n"
             "➡️ Renew at: https://www.linkedin.com/developers/apps\n"
             "_PersonaPulse will continue this run but may fail soon._"
-        )
-        send_telegram_text(message)
+)
+        send_telegram_markdown(message)
         log.warning("[Canary] Token critical (%d days left) – alert sent.", days)
-        # Pipeline continues but with warning
         return True
 
     log.info("[Canary] Token healthy: %d days remaining.", health["days_remaining"])

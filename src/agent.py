@@ -241,6 +241,42 @@ def _article_view_for_report(report_obj) -> dict:
     }
 
 
+def _research_summary_for_report(report_obj) -> dict:
+    """A concise research digest for the Telegram approval message.
+
+    Deliberately bounded: only the research question, up to three finding
+    claims, a single counterargument (or limitation) and short source URLs.
+    Raw source bodies are never exposed.
+    """
+    findings = [
+        finding.claim
+        for finding in report_obj.findings
+        if (finding.claim or "").strip()
+    ][:3]
+
+    counterargument = None
+    for counter in report_obj.counterarguments:
+        if (counter.argument or "").strip():
+            counterargument = counter.argument.strip()
+            break
+
+    limitation = None
+    for lim in report_obj.limitations or []:
+        if (lim or "").strip():
+            limitation = lim.strip()
+            break
+
+    sources = [source for source in report_obj.sources if (source.url or "").strip()]
+    return {
+        "research_question": (report_obj.research_question or "").strip(),
+        "key_findings": findings,
+        "counterargument": counterargument,
+        "limitation": limitation,
+        "source_count": len(sources),
+        "source_urls": [source.url.strip() for source in sources],
+    }
+
+
 def node_store_and_alert(state: AgentState) -> AgentState:
     """
     1. Extract og:image from the source (article URL, or the report's first
@@ -294,6 +330,7 @@ def node_store_and_alert(state: AgentState) -> AgentState:
         linkedin_draft = linkedin_draft,
         x_draft        = x_draft,
         article        = article_ref,
+        research       = _research_summary_for_report(report_obj) if article_is_report else None,
         image_bytes    = image_bytes,
     )
 
@@ -898,6 +935,7 @@ def run_post(
         linkedin_draft = draft_result["linkedin_draft"],
         x_draft        = draft_result["x_draft"],
         article        = article_ref,
+        research       = _research_summary_for_report(report_obj),
         image_bytes    = image_bytes,
     )
     log.info("[Post] Telegram approval request sent – draft id=%s awaiting approval.", post_id)

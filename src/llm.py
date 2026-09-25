@@ -9,7 +9,7 @@ Key Functions
 -------------
 - draft_post(article, style_profile, platform) → str
 - complete_text(system_prompt, user_prompt, max_tokens, temperature) → str
-- send_telegram_alert(post_id, drafts, image_bytes, article_url)
+- send_telegram_alert(post_id, drafts, article, research, image_bytes)
 """
 
 from __future__ import annotations
@@ -285,21 +285,33 @@ def send_telegram_alert(
     linkedin_draft: str,
     x_draft: str,
     article: dict,
+    research: Optional[dict] = None,
     image_bytes: Optional[bytes] = None,
 ) -> None:
     """
     Send a Telegram message to TELEGRAM_CHAT_ID with:
+      - A concise research digest (question, key findings, caveat, source
+        references) when *research* is provided, so the approver can judge
+        the drafting against the research behind it
       - Article info + both drafts as caption text
       - Inline keyboard: [✅ Approve] [❌ Reject]
       - Photo attachment (sendPhoto) if image_bytes is available,
         otherwise plain text (sendMessage)
     """
-    caption = _build_caption(post_id, linkedin_draft, x_draft, article)
     keyboard = _build_inline_keyboard(post_id)
 
     if image_bytes:
+        # sendPhoto caps captions at 1024 – build the caption to that bound.
+        caption = _build_caption(
+            post_id, linkedin_draft, x_draft, article, research,
+            max_length=_MAX_CAPTION_PHOTO,
+        )
         _send_photo(caption, keyboard, image_bytes)
     else:
+        caption = _build_caption(
+            post_id, linkedin_draft, x_draft, article, research,
+            max_length=_MAX_CAPTION_MESSAGE,
+        )
         _send_message(caption, keyboard)
 
 
@@ -307,28 +319,339 @@ def send_telegram_alert(
 # Telegram helpers
 # ---------------------------------------------------------------------------
 
+_MAX_CAPTION_PHOTO = 1024      # Telegram sendPhoto caption limit
+_MAX_CAPTION_MESSAGE = 4096    # Telegram sendMessage text limit
+_DRAFT_LINKEDIN_MAX = 600      # raw budget for the LinkedIn snippet
+_DRAFT_X_MAX = 260             # raw budget for the X (Twitter) snippet
+_DRAFT_LINKEDIN_STEP = 80      # draft content is the lowest-priority text and
+_DRAFT_X_STEP = 40             # is trimmed first, in these decrements
+_RESEARCH_SECTION_MAX = 1000   # worksafe ceiling for the whole digest (all
+                              # required bullets must still fit a typical load)
+_RESEARCH_SHRINK_STEPS = (1000, 800, 600, 400, 200, 0)
+_RESEARCH_QUESTION_MAX = 160
+_RESEARCH_FINDINGS_MAX = 3
+_RESEARCH_LINE_MAX = 120
+_RESEARCH_CAVEAT_MAX = 160
+_RESEARCH_SOURCES_MAX = 5
+_RESEARCH_URL_MAX = 64
+_HEADER_SOURCE_MAX = 160  # escaped-output budget for the dynamic source line
+_HEADER_TITLE_MAX = 120
+_HEADER_TITLE_SLIM = 60
+_HEADER_URL_MAX = 200
+
+# The characters Telegram's *legacy* Markdown parser (parse_mode="Markdown")
+# treats as special: per the Bot API docs, only `_`, `*`, '`' and `[` are
+# escaped outside an entity (plus backslash itself), i.e. MarkdownV2-only
+# escapes like `( ) ~ > # + - = | { } . !` must NOT be applied here. A
+# parentheses or `]` is inert once every `[` is escaped, because we never
+# generate Markdown links. Only dynamic content is escaped; the static format
+# markers we write in captions are left untouched.
+_MARKDOWN_SPECIALS = ("\\", "*", "_", "[", "`")
+
+
+def _clip(value, limit: int) -> str:
+    """Normalize to text and truncate to *limit* chars, appending "…" when cut."""
+    if value is None:
+        return ""
+    value = str(value).strip()
+    if len(value) <= limit:
+        return value
+    if limit <= 1:
+        return value[:limit]
+    return value[: limit - 1] + "…"
+
+
+def _escape_markdown(value) -> str:
+    """Escape Telegram legacy-Markdown specials in *dynamic* text.
+
+    Applies exactly the five characters Telegram's legacy ``Markdown`` parser
+    treats as special (backslash, ``*``, ``_``, ``[``, backtick) – nothing else
+    (so no ``( )``, ``]``, ``~``, ``#``, ... escaping, which would be a
+    MarkdownV2 rule). Backslash is escaped first so an input backslash cannot
+    re-mark an escape we just inserted. URLs are escaped in place (e.g.
+    ``a_b`` -> ``a\\_b``) so they render as the same visible URL; no Markdown
+    links are introduced.
+    """
+    text = value if isinstance(value, str) else str(value)
+    for special in _MARKDOWN_SPECIALS:
+        text = text.replace(special, "\\" + special)
+    return text
+
+
+def _clip_md_bounded(value, budget: int) -> str:
+    """Longest raw prefix of *value* whose *escaped* form fits in *budget*.
+
+    Escaping can double a string's length, so the *escaped* output is measured
+    against the limit, not the raw input: the returned string always satisfies
+    ``len(result) <= budget`` (the binary search maximizes the raw prefix whose
+    escaped length fits). A truncation boundary therefore can never leave a
+    lone escape character or cut through an escape sequence, and Markdown stays
+    valid by construction. When the value is cut short and a single char is
+    left over, an ellipsis is appended to signal the truncation.
+    """
+    if value is None:
+        return ""
+    raw = str(value).strip()
+    if budget <= 0 or not raw:
+        return ""
+
+    low, high, best = 1, min(len(raw), budget), 0
+    while low <= high:
+        mid = (low + high) // 2
+        if len(_escape_markdown(raw[:mid])) <= budget:
+            best = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+    result = _escape_markdown(raw[:best])
+    if best < len(raw) and len(result) + 1 <= budget and not result.endswith("\\"):
+        result += "…"
+    return result
+
+
+def _draft_id_footer(post_id: str, max_length: int) -> str:
+    """Render the Draft ID line bounded to *max_length* with valid Markdown.
+
+    The static label is plain text (no Markdown specials), so any prefix of it
+    is safe to emit. The Draft ID value is escaped *after* raw-clipping so
+    truncation can never split an escape sequence, and the inline-code
+    backticks are only emitted when both can fit – otherwise the value is
+    shown as safe plain text, never as an unmatched backtick.
+    """
+    label = "🆔 Draft ID: "
+    if max_length <= 0:
+        return ""
+    if max_length <= len(label):
+        return _clip(label, max_length)
+    room = max_length - len(label)
+    if room <= 2:
+        return label + _clip_md_bounded(post_id, room)
+    return f"{label}`{_clip_md_bounded(post_id, room - 2)}`"
+
+
+def _unescaped_backticks(text: str) -> list:
+    """Indexes of backticks that are *not* escaped by a preceding backslash.
+
+    An escape is only ``\\`` followed by a character the legacy Telegram
+    ``Markdown`` dialect can actually escape (``\\ * _ [`` and backtick).
+    Arbitrary backslashes such as ``\\a``, ``\\q`` or ``\\(`` are plain
+    characters, not escapes, so they are walked past one char at a time. This
+    mirrors the legacy parser and stops the scanner from assuming every
+    ``\\x`` means "x is escaped".
+    """
+    ticks = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            if (
+                index + 1 < len(text)
+                and text[index + 1] in _MARKDOWN_SPECIALS
+            ):
+                index += 2
+                continue
+        elif char == "`":
+            ticks.append(index)
+        index += 1
+    return ticks
+
+
+def _clip_md_safe(markdown_text, limit: int) -> str:
+    """Longest prefix of *already-formatted* Markdown that stays well-formed.
+
+    NOT interchangeable with :func:`_clip_md_bounded`: that helper escapes raw
+    dynamic values and measures the escaped output; this helper receives text
+    whose Markdown is already intended (e.g. a canary string with ``*bold*``
+    markers) and only ever clips it, preserving that formatting.
+
+    Validation never bypasses the length check: it runs whether or not the
+    text had to be reduced, so valid Markdown that fits is returned unchanged
+    while malformed input is repaired even under the limit. Guarantees:
+      - ``len(result) <= limit``;
+      - no dangling trailing backslash -- a lone ``\\`` whose escapee was cut
+        away is dropped, while a complete ``\\\\`` pair or ``\\X`` escape
+        stays intact: in a trailing run only an odd count leaves one dangling
+        marker, which is the one removed;
+      - no real backtick is left unmatched -- backticks preceded by a backslash
+        (``\\` ``) are literal characters and are never treated as delimiters,
+        and the input is cut back to the last *real* unbalanced backtick.
+    """
+    raw = str(markdown_text)
+    if limit <= 0:
+        return ""
+    candidate = raw if len(raw) <= limit else raw[:limit]
+
+    # A backslash alone at the edge is an escape whose escapee was truncated;
+    # in a trailing run, only an odd count leaves one such dangling marker.
+    if candidate.endswith("\\"):
+        run = len(candidate) - len(candidate.rstrip("\\"))
+        if run % 2 == 1:
+            candidate = candidate[:-1]
+
+    ticks = _unescaped_backticks(candidate)
+    if len(ticks) % 2 == 1:
+        candidate = candidate[: ticks[-1]] or ""
+
+    return candidate
+
+
+def _build_header(article: dict, mode: int) -> str:
+    """Render the approval-context header at a trim level.
+
+    mode 0: source + topic + url (full)
+    mode 1: source + topic
+    mode 2: source + slim topic
+    mode 3: source only
+    mode 4: the bare title line (the last piece of context kept)
+    """
+    source = _clip_md_bounded(article.get("source") or "Unknown", _HEADER_SOURCE_MAX)
+    lines = ["🔔 *New Draft Ready for Approval*"]
+    if mode >= 4:
+        return lines[0]
+
+    lines.append(f"📰 *Source:* {source}")
+
+    if mode <= 1:
+        topic = _clip_md_bounded(article.get("title"), _HEADER_TITLE_MAX)
+    elif mode == 2:
+        topic = _clip_md_bounded(article.get("title"), _HEADER_TITLE_SLIM)
+    else:
+        topic = ""
+    if topic:
+        lines.append(f"📌 *Topic:* {topic}")
+
+    if mode == 0:
+        url = _clip_md_bounded(article.get("url"), _HEADER_URL_MAX)
+        if url:
+            lines.append(f"🔗 {url}")
+
+    return "\n".join(lines)
+
+
 def _build_caption(
     post_id: str,
     linkedin_draft: str,
     x_draft: str,
     article: dict,
+    research: Optional[dict] = None,
+    max_length: int = _MAX_CAPTION_MESSAGE,
 ) -> str:
-    """Build the message caption (max 1024 chars for sendPhoto)."""
-    source = article.get("source", "Unknown")
-    title = article.get("title", "")
-    url = article.get("url", "")
+    """Build the approval caption, escaped and bounded to *max_length*.
 
-    header = f"🔔 *New Draft Ready for Approval*\n\n"
-    header += f"📰 *Source:* {source}\n"
-    header += f"📌 *Topic:* {title[:120]}\n"
-    header += f"🔗 {url}\n\n"
+    The escaped result is guaranteed not to exceed *max_length* by construction
+    (no post-hoc truncation). Trimming follows a fixed priority ladder – draft
+    content is sacrificed before the research digest, which is sacrificed
+    before header detail; the header and the Draft ID footer always survive.
+    For a limit too small for any assembled caption, a Markdown-safe bounded
+    footer is returned instead of a blind truncation of formatted text.
+    """
+    def assemble(li_budget: int, x_budget: int, research_max: int, header_mode: int) -> str:
+        header = _build_header(article, header_mode)
+        research_section = _build_research_section(research, research_max)
 
-    li_section = f"━━━ *LinkedIn Draft* ━━━\n{linkedin_draft[:600]}"
-    x_section  = f"\n\n━━━ *X (Twitter) Draft* ━━━\n{x_draft[:260]}"
+        li_snippet = _clip_md_bounded(linkedin_draft, li_budget)
+        x_snippet = _clip_md_bounded(x_draft, x_budget)
+        li_section = f"━━━ *LinkedIn Draft* ━━━\n{li_snippet}" if li_snippet else ""
+        x_section = f"━━━ *X (Twitter) Draft* ━━━\n{x_snippet}" if x_snippet else ""
+        footer = f"🆔 Draft ID: `{_clip_md_bounded(post_id, 64)}`"
 
-    footer = f"\n\n🆔 Draft ID: `{post_id}`"
+        sections = [header, research_section, li_section, x_section, footer]
+        return "\n\n".join(section for section in sections if section)
 
-    return header + li_section + x_section + footer
+    # Drafts are the least-important text: shrink them first.
+    for li_budget in range(_DRAFT_LINKEDIN_MAX, -1, -_DRAFT_LINKEDIN_STEP):
+        for x_budget in range(_DRAFT_X_MAX, -1, -_DRAFT_X_STEP):
+            caption = assemble(li_budget, x_budget, _RESEARCH_SECTION_MAX, 0)
+            if len(caption) <= max_length:
+                return caption
+
+    # Then the research digest...
+    for research_max in _RESEARCH_SHRINK_STEPS:
+        caption = assemble(0, 0, research_max, 0)
+        if len(caption) <= max_length:
+            return caption
+
+    # ...then header detail; the footer is the absolute last resort.
+    for header_mode in (1, 2, 3, 4):
+        caption = assemble(0, 0, 0, header_mode)
+        if len(caption) <= max_length:
+            return caption
+
+    return _draft_id_footer(post_id, max_length)
+
+
+def _build_research_section(research, max_length: int = _RESEARCH_SECTION_MAX) -> str:
+    """Render a concise, self-contained research digest for the approval message.
+
+    Exposes only the question, finding claims, a single caveat
+    (counterargument or limitation) and short source links – never raw source
+    bodies. Every part is tightly bounded and the whole digest shrinks, in
+    priority order (question > findings > caveat > sources), to fit
+    *max_length*, so long research results cannot balloon the caption.
+    """
+    if not isinstance(research, dict) or not research:
+        return ""
+
+    raw_question = research.get("research_question")
+    findings = [f for f in (research.get("key_findings") or []) if f]
+    caveat = research.get("counterargument")
+    if not caveat:
+        caveat = research.get("limitation")
+    urls = [u for u in (research.get("source_urls") or []) if u]
+    raw_count = research.get("source_count")
+    count = (
+        raw_count
+        if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+        else len(urls)
+    )
+
+    def sources_line() -> str:
+        label = f"📚 *Sources ({count}):*"
+        if urls:
+            label += " " + " · ".join(
+                _clip_md_bounded(u, _RESEARCH_URL_MAX)
+                for u in urls[:_RESEARCH_SOURCES_MAX]
+            )
+        else:
+            label += " none"
+        return label
+
+    def render(findings_n: int, caveat_on: bool, sources_on: int) -> str:
+        lines = []
+        if raw_question:
+            lines.append(
+                f"🧭 *Research question:* "
+                f"{_clip_md_bounded(raw_question, _RESEARCH_QUESTION_MAX)}"
+            )
+        if findings_n and findings:
+            finding_lines = [
+                f" {index}. {_clip_md_bounded(finding, _RESEARCH_LINE_MAX)}"
+                for index, finding in enumerate(findings[:findings_n], start=1)
+            ]
+            lines.append("🔎 *Key findings:*\n" + "\n".join(finding_lines))
+        if caveat_on and caveat:
+            lines.append(
+                f"⚠️ *Caveat:* {_clip_md_bounded(caveat, _RESEARCH_CAVEAT_MAX)}"
+            )
+        if sources_on:
+            lines.append(sources_line())
+        return "\n\n".join(lines)
+
+    # Largest digest that still fits the budget: drop sources before the
+    # caveat before individual findings; the question is kept to the end.
+    candidates = [
+        (_RESEARCH_FINDINGS_MAX, True, 1),
+        (_RESEARCH_FINDINGS_MAX, True, 0),
+        (_RESEARCH_FINDINGS_MAX, False, 0),
+        (2, False, 0),
+        (1, False, 0),
+        (0, False, 0),
+    ]
+    for findings_n, caveat_on, sources_on in candidates:
+        section = render(findings_n, caveat_on, sources_on)
+        if section and len(section) <= max_length:
+            return section
+    return ""
 
 
 def _build_inline_keyboard(post_id: str) -> dict:
@@ -356,7 +679,7 @@ def _send_photo(caption: str, keyboard: dict, image_bytes: bytes) -> None:
             url,
             data={
                 "chat_id": settings.TELEGRAM_CHAT_ID,
-                "caption": caption[:1024],          # Telegram limit
+                "caption": caption,
                 "parse_mode": "Markdown",
                 "reply_markup": json.dumps(keyboard),
             },
@@ -375,7 +698,7 @@ def _send_message(caption: str, keyboard: dict) -> None:
             url,
             json={
                 "chat_id": settings.TELEGRAM_CHAT_ID,
-                "text": caption[:4096],             # Telegram limit
+                "text": caption,
                 "parse_mode": "Markdown",
                 "reply_markup": keyboard,
                 "disable_web_page_preview": False,
@@ -398,20 +721,47 @@ def _handle_telegram_response(resp: httpx.Response, method: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Public: Send plain Telegram text notification (used for canary alerts)
+# Public: Simple Telegram text notifications / canary alerts
 # ---------------------------------------------------------------------------
 
 def send_telegram_text(message: str) -> None:
-    """Send a simple Telegram text message (no keyboard, no image)."""
+    """Send a plain-text Telegram notification (no Markdown parsing).
+
+    The message is arbitrary dynamic text, so Markdown interpretation is never
+    requested and the text is sent verbatim (nothing to escape). It is bounded
+    to Telegram's 4096-character limit with the same safe closer used for the
+    approval captions.
+    """
     url = f"{settings.telegram_api_base}/sendMessage"
     with httpx.Client(timeout=15) as client:
         resp = client.post(
             url,
             json={
                 "chat_id": settings.TELEGRAM_CHAT_ID,
-                "text": message[:4096],
-                "parse_mode": "Markdown",
+                "text": _clip(message, _MAX_CAPTION_MESSAGE),
                 "disable_web_page_preview": True,
             },
         )
     _handle_telegram_response(resp, "sendMessage[plain]")
+
+
+def send_telegram_markdown(message: str) -> None:
+    """Send a Markdown-formatted Telegram notification, bounded safely.
+
+    Only for callers that intentionally build Markdown (e.g. the canary
+    alerts). The text is truncated to a well-formed prefix so a length
+    boundary can never split an escape sequence or leave an unmatched
+    backtick.
+    """
+    url = f"{settings.telegram_api_base}/sendMessage"
+    with httpx.Client(timeout=15) as client:
+        resp = client.post(
+            url,
+            json={
+                "chat_id": settings.TELEGRAM_CHAT_ID,
+                "text": _clip_md_safe(message, _MAX_CAPTION_MESSAGE),
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            },
+        )
+    _handle_telegram_response(resp, "sendMessage[markdown]")

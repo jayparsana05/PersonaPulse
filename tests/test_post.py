@@ -1040,7 +1040,39 @@ class AgentNodeTest(unittest.TestCase):
         self.assertIn("LI", store_kwargs["content"])
         alert_kwargs = m_alert.call_args.kwargs
         self.assertEqual(alert_kwargs["article"]["title"], "Agentic orchestration")
+        # The research digest travels with the approval message so the
+        # approver can see what the drafts are based on.
+        research = alert_kwargs["research"]
+        self.assertEqual(research["source_count"], 1)
+        self.assertEqual(research["research_question"], "Which orchestration framework scales best for production agents?")
+        self.assertIn(_GROWTH_CLAIM.split(".")[0], " ".join(research["key_findings"]))
         self.assertEqual(result["post_id"], "post-1")
+
+    def test_node_store_and_alert_legacy_article_path_has_no_research(self):
+        # No report present -> the legacy article path must still alert, but
+        # with research=None so the digest is omitted (no empty section).
+        state = {
+            "article": {
+                "title": "Plain article",
+                "body": "Body",
+                "url": "https://ex.com/article",
+                "source": "ex.com",
+            },
+            "embedding": [0.1],
+            "linkedin_draft": "LI",
+            "x_draft": "X",
+        }
+        with patch("src.agent.extract_og_image_with_url", return_value=("img", b"bytes")), \
+                patch("src.agent.store_draft", return_value="post-2") as m_store, \
+                patch("src.agent.send_telegram_alert") as m_alert:
+            result = node_store_and_alert(state)
+
+        store_kwargs = m_store.call_args.kwargs
+        self.assertEqual(store_kwargs["topic"], "Plain article")
+        alert_kwargs = m_alert.call_args.kwargs
+        self.assertIsNone(alert_kwargs["research"])
+        self.assertEqual(alert_kwargs["post_id"], "post-2")
+        self.assertEqual(result["post_id"], "post-2")
 
     @staticmethod
     def _report_dict() -> dict:
