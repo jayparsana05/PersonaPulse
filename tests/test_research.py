@@ -41,7 +41,7 @@ for _key, _value in _REQUIRED_ENV.items():
     os.environ.setdefault(_key, _value)
 
 from src.research import generate_research_queries, research_question  # noqa: E402
-from src.agent import persist_research_question, run_research  # noqa: E402
+from src.agent import persist_research_question, run_research, run_research_or_reuse  # noqa: E402
 from src.models import ResearchQuestion, ResearchSource  # noqa: E402
 
 
@@ -510,6 +510,345 @@ class PersistResearchQuestionTest(unittest.TestCase):
         sources_store.assert_called_once()
         self.assertEqual(sources_store.call_args.args[0], "qid-9")
         self.assertEqual(result["research_source_ids"], ["id-1"])
+
+
+class RunResearchSkipKnownSourcesTest(unittest.TestCase):
+    """run_research(skip_known_sources=True) keeps source-level dedup across
+    sessions: already-known URLs still appear in the in-memory result but are
+    not persisted again."""
+
+    def test_known_source_is_filtered_from_persistence_only(self):
+        results = [
+            raw_result(url="https://ex.com/known", score=0.9),
+            raw_result(url="https://ex.com/fresh", score=0.8),
+        ]
+        with patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+             patch("src.research.search_news", return_value=results), \
+             patch("src.agent.get_known_source_urls", return_value={"https://ex.com/known"}), \
+             patch("src.agent.store_research_sources", return_value=["id-2"]) as store:
+            result = run_research(research_question_fixture(), research_question_id="qid-1", skip_known_sources=True)
+
+        self.assertEqual(result["status"], "ok")
+        # In-memory result keeps both sources (dedup is only about persistence).
+        self.assertEqual(len(result["research_sources"]), 2)
+        # Only the fresh source reaches persistence.
+        self.assertEqual(len(store.call_args.args[1]), 1)
+        self.assertEqual(store.call_args.args[1][0].url, "https://ex.com/fresh")
+
+    def test_default_disables_cross_session_filter(self):
+        results = [raw_result(url="https://ex.com/known", score=0.9)]
+        with patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+             patch("src.research.search_news", return_value=results), \
+             patch("src.agent.get_known_source_urls") as known, \
+             patch("src.agent.store_research_sources", return_value=["id-1"]) as store:
+            run_research(research_question_fixture(), research_question_id="qid-1")
+        known.assert_not_called()
+        self.assertEqual(len(store.call_args.args[1]), 1)
+
+    def test_memory_unavailability_falls_back_to_persist_everything(self):
+        results = [raw_result(url="https://ex.com/known", score=0.9)]
+        with patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+             patch("src.research.search_news", return_value=results), \
+             patch("src.agent.get_known_source_urls", side_effect=RuntimeError("db down")), \
+             patch("src.agent.store_research_sources", return_value=["id-1"]) as store:
+            result = run_research(research_question_fixture(), research_question_id="qid-1", skip_known_sources=True)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(store.call_args.args[1]), 1)
+
+
+class MemorySim:
+    """In-memory mirror of the research-session store (exact matching only).
+
+    Mirrors the exact-match semantics of ``check_topic_researched`` plus the
+    store / hydrate / delete functions, so ``run_research_or_reuse``'s reuse
+    gate and discard-cleanup run end to end without Supabase. The ``search``
+    context manager installs the standard patches and yields the ``search_news``
+    mock for call assertions.
+    """
+
+    def __init__(self):
+        self.sessions = []
+        self._next = 1
+
+    @staticmethod
+    def _norm(text):
+        return " ".join((text or "").split()).casefold()
+
+    def session_ids(self):
+        return [s["id"] for s in self.sessions]
+
+    def check_topic_researched(self, topic, question, **kwargs):
+        norm_topic = self._norm(topic)
+        norm_question = self._norm(question)
+        for session in self.sessions:
+            same_topic = bool(norm_topic) and self._norm(session["topic"]) == norm_topic
+            same_question = bool(norm_question) and self._norm(session["question"]) == norm_question
+            if same_topic and same_question:
+                return {"matched": True, "reason": "exact", "question_id": session["id"],
+                        "matched_question": session["meta"], "similarity": None}
+            if same_question:
+                return {"matched": True, "reason": "exact", "question_id": session["id"],
+                        "matched_question": session["meta"], "similarity": None}
+        return {"matched": False, "reason": None, "question_id": None,
+                "matched_question": None, "similarity": None}
+
+    def get_research_sources_for_question(self, question_id):
+        for session in self.sessions:
+            if session["id"] == question_id:
+                return list(session["sources"]), list(session["source_ids"])
+        return [], []
+
+    def store_research_question(self, rq):
+        question_id = f"qid-{self._next}"
+        self._next += 1
+        meta = {"id": question_id, "topic": rq.topic, "question": rq.question,
+                "status": getattr(rq, "status", None)}
+        self.sessions.append({"id": question_id, "topic": rq.topic, "question": rq.question,
+                              "sources": [], "source_ids": [], "meta": meta})
+        return question_id
+
+    def store_research_sources(self, research_question_id, sources):
+        for session in self.sessions:
+            if session["id"] == research_question_id:
+                ids = [f"src-{len(session['source_ids']) + i}" for i in range(len(sources))]
+                session["sources"] = list(sources)
+                session["source_ids"] = ids
+                return ids
+        return []
+
+    def delete_research_question(self, research_question_id):
+        self.sessions[:] = [s for s in self.sessions if s["id"] != research_question_id]
+
+    def seed(self, question_id="qid-old", with_sources=False):
+        """Pre-seed a remembered session for the fixture topic/question."""
+        rq = research_question_fixture()
+        session = {"id": question_id, "topic": rq.topic, "question": rq.question,
+                   "sources": [], "source_ids": [],
+                   "meta": {"id": question_id, "topic": rq.topic,
+                            "question": rq.question, "status": rq.status}}
+        if with_sources:
+            session["sources"] = [ResearchSource(url="https://ex.com/old", title="Old source")]
+            session["source_ids"] = ["src-0"]
+        self.sessions.append(session)
+
+    @contextmanager
+    def search(self, search_side_effect):
+        with patch.multiple(
+            "src.agent",
+            check_topic_researched=self.check_topic_researched,
+            get_research_sources_for_question=self.get_research_sources_for_question,
+            get_known_source_urls=lambda: set(),
+            store_research_question=self.store_research_question,
+            store_research_sources=self.store_research_sources,
+            delete_research_question=self.delete_research_question,
+        ), patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+           patch("src.research.search_news", side_effect=search_side_effect) as search_mock:
+            yield search_mock
+
+
+class RunResearchOrReuseTest(unittest.TestCase):
+    """run_research_or_reuse(): remember researched topics/questions, reuse
+    exact/semantic duplicates, and never prevent follow-up research."""
+
+    def test_exact_duplicate_reuses_session(self):
+        rq = research_question_fixture()
+        with patch("src.agent.check_topic_researched", return_value={
+                "matched": True, "reason": "exact",
+                "question_id": "qid-old", "matched_question": {}, "similarity": None,
+            }) as check, \
+             patch("src.agent.get_research_sources_for_question",
+                   return_value=([ResearchSource(url="https://ex.com/a", title="A")], ["src-1"])), \
+             patch("src.agent.research_stage") as stage, \
+             patch("src.agent.store_research_sources") as store:
+            result = run_research_or_reuse(rq)
+
+        check.assert_called_once_with(rq.topic, rq.question, threshold=None)
+        self.assertEqual(result["status"], "reused")
+        self.assertEqual(result["duplicate_reason"], "exact")
+        self.assertEqual(result["reused_question_id"], "qid-old")
+        self.assertEqual(result["research_question_id"], "qid-old")
+        self.assertEqual([s.url for s in result["research_sources"]], ["https://ex.com/a"])
+        stage.assert_not_called()
+        store.assert_not_called()
+
+    def test_semantic_duplicate_reuses_session(self):
+        with patch("src.agent.check_topic_researched", return_value={
+                "matched": True, "reason": "semantic",
+                "question_id": "qid-old", "matched_question": {}, "similarity": 0.94,
+            }), \
+             patch("src.agent.get_research_sources_for_question",
+                   return_value=([ResearchSource(url="https://ex.com/b")], ["src-2"])):
+            result = run_research_or_reuse(research_question_fixture())
+        self.assertEqual(result["status"], "reused")
+        self.assertEqual(result["duplicate_reason"], "semantic")
+
+    def test_related_but_different_question_runs_fresh_research(self):
+        """Follow-up research on a meaningfully different question proceeds."""
+        with patch("src.agent.check_topic_researched", return_value={
+                "matched": False, "reason": None, "question_id": None,
+                "matched_question": None, "similarity": 0.4,
+            }), \
+             patch("src.agent.store_research_question", return_value="qid-new") as store_q, \
+             patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+             patch("src.research.search_news", return_value=[raw_result(url="https://ex.com/1")]), \
+             patch("src.agent.get_known_source_urls", return_value=set()), \
+             patch("src.agent.store_research_sources", return_value=["id-1"]):
+            result = run_research_or_reuse(research_question_fixture())
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["duplicate_reason"], None)
+        self.assertEqual(result["research_question_id"], "qid-new")
+        self.assertEqual(len(result["research_sources"]), 1)
+        store_q.assert_called_once()
+
+    def test_memory_unavailable_does_not_prevent_research(self):
+        with patch("src.agent.check_topic_researched", side_effect=RuntimeError("db down")), \
+             patch("src.agent.store_research_question", return_value="qid-new"), \
+             patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+             patch("src.research.search_news", return_value=[raw_result(url="https://ex.com/1")]), \
+             patch("src.agent.get_known_source_urls", return_value=set()), \
+             patch("src.agent.store_research_sources", return_value=["id-1"]):
+            result = run_research_or_reuse(research_question_fixture())
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["research_question_id"], "qid-new")
+
+    def test_remembered_session_without_sources_runs_fresh_research(self):
+        """A matched session with no usable stored sources is not reused empty."""
+        with patch("src.agent.check_topic_researched", return_value={
+                "matched": True, "reason": "exact",
+                "question_id": "qid-old", "matched_question": {}, "similarity": None,
+            }), \
+             patch("src.agent.get_research_sources_for_question", return_value=([], [])), \
+             patch("src.agent.store_research_question", return_value="qid-new") as store_q, \
+             patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+             patch("src.research.search_news",
+                   return_value=[raw_result(url="https://ex.com/1")]) as search, \
+             patch("src.agent.get_known_source_urls", return_value=set()), \
+             patch("src.agent.store_research_sources", return_value=["id-1"]):
+            result = run_research_or_reuse(research_question_fixture())
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["duplicate_reason"], None)
+        self.assertEqual(result["research_question_id"], "qid-new")
+        self.assertEqual(len(result["research_sources"]), 1)
+        store_q.assert_called_once()
+        search.assert_called_once()
+
+
+def _hydration_failure(*args, **kwargs):
+    raise RuntimeError("hydration down")
+
+
+class RunResearchOrReuseMemoryTest(unittest.TestCase):
+    """run_research_or_reuse against an in-memory session mirror:
+
+    - failed / incomplete research is never remembered,
+    - an empty or un-hydratable remembered session never yields an empty
+      ``reused`` result (fresh research runs instead),
+    - successful research is reused on a later run.
+    """
+
+    def setUp(self):
+        self.sim = MemorySim()
+
+    def _run(self, search_results, **kwargs):
+        """Run the fixture question once; returns (result, search_news mock)."""
+        with self.sim.search(search_results) as search:
+            result = run_research_or_reuse(research_question_fixture(), **kwargs)
+        return result, search
+
+    def test_first_attempt_without_sources_then_next_run_researches_fresh(self):
+        first, _ = self._run([[]])
+        self.assertEqual(first["status"], "empty")
+        self.assertIsNone(first["research_question_id"])
+        self.assertEqual(self.sim.sessions, [])
+
+        second, _ = self._run([[raw_result(url="https://ex.com/fresh")]])
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(len(self.sim.sessions), 1)
+        self.assertNotEqual(second["research_question_id"], first["research_question_id"])
+
+    def test_research_failure_then_next_run_researches_fresh(self):
+        first, _ = self._run([[RuntimeError("provider down")]])
+        self.assertEqual(first["status"], "empty")
+        self.assertIsNone(first["research_question_id"])
+        self.assertEqual(self.sim.sessions, [])
+
+        second, _ = self._run([[raw_result(url="https://ex.com/ok")]])
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(len(self.sim.sessions), 1)
+
+    def test_successful_research_is_reused_on_the_next_run(self):
+        first, _ = self._run([[raw_result(url="https://ex.com/a")]])
+        self.assertEqual(first["status"], "ok")
+        qid = first["research_question_id"]
+        self.assertEqual(self.sim.session_ids(), [qid])
+        self.assertEqual(len(self.sim.sessions[0]["source_ids"]), 1)
+
+        second, search = self._run([[raw_result(url="https://ex.com/ignored")]])
+        self.assertEqual(second["status"], "reused")
+        self.assertEqual(second["duplicate_reason"], "exact")
+        self.assertEqual(second["reused_question_id"], qid)
+        self.assertEqual(second["research_question_id"], qid)
+        self.assertEqual([s.url for s in second["research_sources"]], ["https://ex.com/a"])
+        search.assert_not_called()
+
+    def test_failed_research_cleans_up_the_created_session(self):
+        with patch.multiple(
+            "src.agent",
+            check_topic_researched=self.sim.check_topic_researched,
+            get_research_sources_for_question=self.sim.get_research_sources_for_question,
+            get_known_source_urls=lambda: set(),
+            store_research_question=self.sim.store_research_question,
+            store_research_sources=self.sim.store_research_sources,
+            delete_research_question=self.sim.delete_research_question,
+        ), patch("src.research.complete_text",
+                            return_value=_dump({"queries": ["q"]})), \
+            patch("src.research.search_news", return_value=[]):
+            result = run_research_or_reuse(research_question_fixture())
+
+        self.assertEqual(result["status"], "empty")
+        self.assertIsNone(result["research_question_id"])
+        self.assertEqual(self.sim.sessions, [])
+
+    def test_remembered_session_without_stored_sources_runs_fresh(self):
+        self.sim.seed("qid-old", with_sources=False)
+        result, _ = self._run([[raw_result(url="https://ex.com/back-to-work")]])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["duplicate_reason"], None)
+        self.assertNotEqual(result["research_question_id"], "qid-old")
+        self.assertEqual(len(self.sim.sessions), 2)
+        self.assertEqual(self.sim.session_ids(), ["qid-old", result["research_question_id"]])
+
+    def test_remembered_session_hydration_failure_runs_fresh(self):
+        self.sim.seed("qid-old", with_sources=True)
+        with patch.multiple(
+            "src.agent",
+            check_topic_researched=self.sim.check_topic_researched,
+            get_research_sources_for_question=_hydration_failure,
+            get_known_source_urls=lambda: set(),
+            store_research_question=self.sim.store_research_question,
+            store_research_sources=self.sim.store_research_sources,
+            delete_research_question=self.sim.delete_research_question,
+        ), patch("src.research.complete_text", return_value=_dump({"queries": ["q"]})), \
+            patch("src.research.search_news",
+                  return_value=[raw_result(url="https://ex.com/fallback")]):
+            result = run_research_or_reuse(research_question_fixture())
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["duplicate_reason"], None)
+        self.assertNotEqual(result["research_question_id"], "qid-old")
+        self.assertEqual(result["reused_question_id"], None)
+
+    def test_remembered_session_with_valid_sources_is_reused(self):
+        self.sim.seed("qid-old", with_sources=True)
+        result, search = self._run([[]])
+        self.assertEqual(result["status"], "reused")
+        self.assertEqual(result["duplicate_reason"], "exact")
+        self.assertEqual(result["reused_question_id"], "qid-old")
+        self.assertEqual(result["research_question_id"], "qid-old")
+        self.assertEqual([s.url for s in result["research_sources"]], ["https://ex.com/old"])
+        search.assert_not_called()
 
 
 if __name__ == "__main__":

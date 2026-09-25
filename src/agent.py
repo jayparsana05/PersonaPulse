@@ -46,7 +46,12 @@ from src.ingestion import (
 from src.llm import draft_post, send_telegram_alert
 from src.memory import (
     check_is_duplicate,
+    check_topic_researched,
+    delete_research_question,
+    filter_repeated_sources,
+    get_known_source_urls,
     get_normalized_embedding,
+    get_research_sources_for_question,
     get_style_profile,
     store_draft,
     store_research_question,
@@ -494,6 +499,7 @@ def run_selection(
     query: str = "",
     limit: Optional[int] = None,
     candidates: Optional[list] = None,
+    check_researched: bool = False,
 ) -> dict:
     """
     Run the Select Topic stage of the research agent.
@@ -510,6 +516,13 @@ def run_selection(
         Pre-discovered candidates; when provided, discovery is skipped
         (useful for tests and for running selection against existing
         candidates).
+    check_researched : bool
+        When True, the framed question is checked against remembered research
+        sessions BEFORE a new row is stored: an exact/semantic duplicate
+        reuses the existing session id instead of duplicating it, and the
+        result gains an ``already_researched`` bool. Follow-up questions
+        (same topic, different angle) are never blocked. Default False keeps
+        the historical behavior. Persistence stays non-blocking either way.
 
     Returns
     -------
@@ -519,6 +532,7 @@ def run_selection(
         research_question  : ResearchQuestion or None (when nothing was selected)
         research_question_id : UUID of the persisted research_questions row,
                               or None when nothing was selected (or persistence failed)
+        already_researched : bool (only present when check_researched=True)
     """
     logging.basicConfig(
         level  = logging.INFO,
@@ -549,18 +563,32 @@ def run_selection(
     question = frame_question(selection.selected, query=query)
 
     question_id = None
+    already_researched = None
     if question is not None:
         log.info("  ❓ Research question: %s", question.question)
         if question.aspects:
             log.info("  Aspects: %s", ", ".join(question.aspects))
-        question_id = persist_research_question(question)
+        if check_researched:
+            dup = check_topic_researched(question.topic, question.question)
+            if dup["matched"]:
+                already_researched = dup
+                question_id = dup["question_id"]
+                log.info(
+                    "  ♻️  Already researched (reason=%s, session=%s) – reusing session, not storing a duplicate.",
+                    dup["reason"], question_id,
+                )
+        if question_id is None:
+            question_id = persist_research_question(question)
 
-    return {
+    result = {
         "topic_candidates": list(candidates),
         "selection": selection,
         "research_question": question,
         "research_question_id": question_id,
     }
+    if check_researched:
+        result["already_researched"] = bool(already_researched is not None and already_researched.get("matched"))
+    return result
 
 
 def persist_research_question(rq) -> Optional[str]:
@@ -593,6 +621,7 @@ def run_research(
     max_sources_per_query: Optional[int] = None,
     max_sources: Optional[int] = None,
     min_score: Optional[float] = None,
+    skip_known_sources: bool = False,
 ) -> dict:
     """
     Run the Prompt-4 research stage for an existing ResearchQuestion.
@@ -609,6 +638,11 @@ def run_research(
         creating unlinked research_sources rows.
     use_llm / max_queries / max_sources_per_query / max_sources / min_score :
         passed through to the research stage (see src.research.research_question).
+    skip_known_sources : bool
+        When True, sources whose normalized URL was already recorded in an
+        earlier research session are kept in the in-memory result but skipped
+        on persistence (the existing per-run _dedupe_sources is unchanged).
+        Non-blocking: memory failures degrade to persisting everything.
 
     Returns
     -------
@@ -638,9 +672,25 @@ def run_research(
 
     source_ids: list[str] = []
     if sources:
-        if research_question_id:
+        to_store = list(sources)
+        if skip_known_sources:
             try:
-                source_ids = store_research_sources(research_question_id, sources)
+                known_urls = get_known_source_urls()          # non-blocking
+            except Exception as exc:  # pylint: disable=broad-except
+                log.warning(
+                    "⚠️  Could not check known sources (%s: %s) – persisting everything.",
+                    type(exc).__name__, exc,
+                )
+                known_urls = set()
+            to_store, repeated = filter_repeated_sources(sources, known_urls)
+            if repeated:
+                log.info(
+                    "📚 Skipped persisting %d source(s) already stored in earlier sessions.",
+                    len(repeated),
+                )
+        if to_store and research_question_id:
+            try:
+                source_ids = store_research_sources(research_question_id, to_store)
             except Exception as exc:  # pylint: disable=broad-except
                 log.warning(
                     "⚠️  Could not persist research sources (%s: %s) – continuing with in-memory result.",
@@ -661,6 +711,145 @@ def run_research(
         "status": "ok" if sources else "empty",
         "research_source_ids": source_ids,
     }
+
+
+# ---------------------------------------------------------------------------
+# Research-session memory entry point
+# ---------------------------------------------------------------------------
+# Remembered topics/questions gate redundant re-research: an exact or semantic
+# duplicate reuses the stored session; a related but meaningfully different
+# question always runs (follow-up research is never blocked here).
+
+def run_research_or_reuse(
+    rq,
+    research_question_id: Optional[str] = None,
+    use_llm: bool = True,
+    reuse_researched: bool = True,
+    skip_known_sources: bool = True,
+    threshold: Optional[float] = None,
+    max_queries: Optional[int] = None,
+    max_sources_per_query: Optional[int] = None,
+    max_sources: Optional[int] = None,
+    min_score: Optional[float] = None,
+) -> dict:
+    """
+    Research *rq* unless the topic/question is already remembered.
+
+    Adds a memory gate in front of :func:`run_research`:
+
+    - Exact or semantic duplicate (see ``check_topic_researched``): the
+      stored research session is reused — its sources are hydrated from the
+      database and NO new search/persistence happens, so the same topic is
+      never re-researched (or duplicated on disk). Reuse only fires when the
+      remembered session actually has usable persisted sources; a session
+      whose sources cannot be hydrated (DB failure) or that recorded no
+      sources at all falls back to fresh research instead of returning an
+      empty "reused" result.
+    - Related but meaningfully different question (same topic, new angle):
+      NOT a duplicate — research runs normally. Follow-up research is allowed.
+    - Memory unavailable / embedding failure: research runs normally
+      (non-blocking, matching the rest of the research agent).
+
+    When *research_question_id* is None and a brand-new question proceeds to
+    research, the new question row is persisted first so the collected sources
+    stay traceable (same mechanism the CLI entry points already used). If that
+    run produces nothing persistable (failure / no sources / persistence
+    produced no rows), the freshly created session is discarded so a failed
+    or incomplete run is never remembered as a reusable duplicate.
+
+    Returns
+    -------
+    dict – a :func:`run_research` result, plus:
+        reused_question_id   : UUID of the reused session (duplicate path only)
+        duplicate_reason     : "exact" | "semantic" | None
+        research_question_id : the session UUID used (reused or newly stored)
+    """
+    logging.basicConfig(
+        level  = logging.INFO,
+        format = "%(asctime)s %(levelname)-8s │ %(message)s",
+        datefmt= "%H:%M:%S",
+    )
+
+    if reuse_researched:
+        try:
+            dup = check_topic_researched(
+                getattr(rq, "topic", rq),
+                getattr(rq, "question", rq),
+                threshold=threshold,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            log.warning(
+                "⚠️  Research-memory check failed (%s: %s) – proceeding with fresh research.",
+                type(exc).__name__, exc,
+            )
+            dup = {"matched": False}
+        if dup["matched"]:
+            known_id = dup["question_id"] or research_question_id
+            try:
+                reused_sources, reused_ids = get_research_sources_for_question(known_id)
+            except Exception as exc:  # pylint: disable=broad-except
+                log.warning(
+                    "⚠️  Could not hydrate remembered session %s (%s: %s) – falling back to fresh research.",
+                    known_id, type(exc).__name__, exc,
+                )
+                reused_sources, reused_ids = [], []
+            if reused_sources:
+                log.info(
+                    "♻️  Already researched (reason=%s, session=%s) – reusing '%s' instead of re-searching.",
+                    dup["reason"], known_id, getattr(rq, "question", rq),
+                )
+                return {
+                    "research_question": rq,
+                    "research_sources": reused_sources,
+                    "status": "reused",
+                    "research_source_ids": reused_ids,
+                    "reused_question_id": known_id,
+                    "duplicate_reason": dup["reason"],
+                    "research_question_id": known_id,
+                }
+            log.warning(
+                "🧭 Remembered session %s has no usable stored sources – falling back to fresh research.",
+                known_id,
+            )
+
+    created_id: Optional[str] = None
+    if research_question_id is None:
+        research_question_id = persist_research_question(rq)
+        created_id = research_question_id
+
+    result = run_research(
+        rq,
+        research_question_id=research_question_id,
+        use_llm=use_llm,
+        max_queries=max_queries,
+        max_sources_per_query=max_sources_per_query,
+        max_sources=max_sources,
+        min_score=min_score,
+        skip_known_sources=skip_known_sources,
+    )
+    result["reused_question_id"] = None
+    result["duplicate_reason"] = None
+    result["research_question_id"] = research_question_id
+
+    # A brand-new session that yielded nothing persistable must not linger as
+    # a remembered (but empty) session: the next run for the same question
+    # would otherwise hint a reuse and then fall back to research anyway.
+    usable = bool(result.get("research_sources")) and bool(result.get("research_source_ids"))
+    if created_id is not None and not usable:
+        log.warning(
+            "🧽 Research produced nothing persistable for new session %s – discarding it (not remembered).",
+            created_id,
+        )
+        try:
+            delete_research_question(created_id)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.warning(
+                "⚠️  Could not delete incomplete research session %s (%s: %s).",
+                created_id, type(exc).__name__, exc,
+            )
+        else:
+            result["research_question_id"] = None
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -965,8 +1154,7 @@ if __name__ == "__main__":
             question=args[1] if len(args) > 1 else "",
             aspects=[],
         )
-        question_id = persist_research_question(rq)
-        result = run_research(rq, research_question_id=question_id)
+        result = run_research_or_reuse(rq)
         sys.exit(0)
 
     if args and args[0] == "--evidence":
@@ -975,8 +1163,8 @@ if __name__ == "__main__":
             question=args[1] if len(args) > 1 else "",
             aspects=[],
         )
-        question_id = persist_research_question(rq)
-        research = run_research(rq, research_question_id=question_id)
+        research = run_research_or_reuse(rq)
+        question_id = research["research_question_id"]
         result = run_evidence(
             research["research_question"],
             research["research_sources"],
@@ -990,8 +1178,8 @@ if __name__ == "__main__":
             question=args[1] if len(args) > 1 else "",
             aspects=[],
         )
-        question_id = persist_research_question(rq)
-        research = run_research(rq, research_question_id=question_id)
+        research = run_research_or_reuse(rq)
+        question_id = research["research_question_id"]
         evidence_result = run_evidence(
             research["research_question"],
             research["research_sources"],
@@ -1010,8 +1198,8 @@ if __name__ == "__main__":
             question=args[1] if len(args) > 1 else "",
             aspects=[],
         )
-        question_id = persist_research_question(rq)
-        research = run_research(rq, research_question_id=question_id)
+        research = run_research_or_reuse(rq)
+        question_id = research["research_question_id"]
         evidence_result = run_evidence(
             research["research_question"],
             research["research_sources"],
@@ -1037,8 +1225,8 @@ if __name__ == "__main__":
             question=args[1] if len(args) > 1 else "",
             aspects=[],
         )
-        question_id = persist_research_question(rq)
-        research = run_research(rq, research_question_id=question_id)
+        research = run_research_or_reuse(rq)
+        question_id = research["research_question_id"]
         evidence_result = run_evidence(
             research["research_question"],
             research["research_sources"],

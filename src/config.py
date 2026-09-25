@@ -157,6 +157,14 @@ class Settings:
     RESEARCH_MAX_SOURCES: int = 10
     RESEARCH_MIN_SCORE: float = 0.1
 
+    # ── Research memory (session deduplication) ─────────────────────────────
+    # RESEARCH_DUPLICATE_THRESHOLD – minimum cosine similarity between a
+    # proposed research question and a previously stored session embedding
+    # for a *semantic* duplicate. Exact normalized-text matches always win
+    # regardless of this value; a related but meaningfully different question
+    # stays below the threshold and is allowed as follow-up research.
+    RESEARCH_DUPLICATE_THRESHOLD: float = 0.88
+
     # ── Evidence (Phase 3, step 1) ─────────────────────────────────────────
     # EVIDENCE_MAX_CLAIMS_PER_SOURCE – max validated claims kept per source,
     #                                   per research question.
@@ -241,6 +249,8 @@ settings = Settings(
     RESEARCH_MAX_SOURCES_PER_QUERY=_optional_int("RESEARCH_MAX_SOURCES_PER_QUERY", 5),
     RESEARCH_MAX_SOURCES=_optional_int("RESEARCH_MAX_SOURCES", 10),
     RESEARCH_MIN_SCORE=_optional_float("RESEARCH_MIN_SCORE", 0.1),
+    # Research memory (session deduplication)
+    RESEARCH_DUPLICATE_THRESHOLD=_optional_float("RESEARCH_DUPLICATE_THRESHOLD", 0.88),
     # Evidence tuning (Phase 3, step 1)
     EVIDENCE_MAX_CLAIMS_PER_SOURCE=_optional_int("EVIDENCE_MAX_CLAIMS_PER_SOURCE", 5),
     EVIDENCE_SOURCE_BODY_CHARS=_optional_int("EVIDENCE_SOURCE_BODY_CHARS", 8000),

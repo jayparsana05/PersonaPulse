@@ -2,16 +2,33 @@
 PersonaPulse – Memory Module
 ============================
 Handles vector embeddings (Gemini gemini-embedding-001) with
-L2 normalization, and semantic deduplication against the
-Supabase posts table via pgvector cosine distance queries.
+L2 normalization, and semantic deduplication against Supabase.
+
+Two kinds of memory live here:
+
+1. Post memory (production pipeline) – embeddings + pgvector cosine
+   distance against the ``posts`` table via ``match_posts_by_embedding``.
+
+2. Research-session memory (research agent) – remembers researched
+   topics/questions so the same topic is never re-searched. Exact
+   (normalized text) matches are decided first; semantic (embedding
+   cosine) matches reuse the same threshold machinery. Sources already
+   recorded in earlier sessions are kept source-level deduplicated
+   across sessions as well.
 
 Key Functions
 -------------
 - get_normalized_embedding(text)  → list[float]
 - check_is_duplicate(embedding, threshold)  → bool
 - store_draft(platform, topic, content, embedding, article_url, image_url) → str  (UUID)
-- store_research_question(question)  → str  (UUID)
+- check_topic_researched(topic, question, threshold, use_embedding)  → dict
+- get_known_research_questions(limit)  → list[dict]
+- get_research_sources_for_question(question_id)  → (list[ResearchSource], list[str])
+- store_research_question(question, embedding)  → str  (UUID)
 - store_research_sources(question_id, sources)  → list[str]  (UUIDs)
+- delete_research_question(question_id)          → None
+- get_known_source_urls()  → set[str]
+- filter_repeated_sources(sources, known_urls)  → (list, list)
 - update_post_status(post_id, status)
 """
 
@@ -28,6 +45,7 @@ from google.genai import types as genai_types
 from supabase import create_client, Client
 
 from src.config import settings
+from src.ingestion import _normalize_url
 from src.models import ResearchQuestion, ResearchSource
 
 log = logging.getLogger(__name__)
@@ -55,6 +73,20 @@ def _get_supabase() -> Client:
             settings.SUPABASE_SERVICE_ROLE_KEY,
         )
     return _supabase_client
+
+
+def _vector_literal(embedding: list[float]) -> str:
+    """Serialize a float embedding as a PostgreSQL vector literal."""
+    return "[" + ",".join(f"{x:.8f}" for x in embedding) + "]"
+
+
+def _normalize_research_text(text) -> str:
+    """Canonical dedup key for research topics/questions.
+
+    Case-folds and collapses whitespace so "Agentic   AI " and "agentic ai"
+    compare equal, without inventing meaning (unlike a fuzzy match).
+    """
+    return " ".join((text or "").split()).casefold()
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +150,7 @@ def check_is_duplicate(
     distance_cutoff = 1.0 - threshold            # e.g. 0.15 for threshold=0.85
 
     # Format the embedding as a PostgreSQL vector literal
-    vector_literal = "[" + ",".join(f"{x:.8f}" for x in embedding) + "]"
+    vector_literal = _vector_literal(embedding)
 
     # Use raw SQL via RPC to leverage the pgvector operator
     result = supabase.rpc(
@@ -158,7 +190,7 @@ def store_draft(
     """
     supabase = _get_supabase()
 
-    vector_literal = "[" + ",".join(f"{x:.8f}" for x in embedding) + "]"
+    vector_literal = _vector_literal(embedding)
 
     row = {
         "platform": platform,
@@ -180,10 +212,18 @@ def store_draft(
 # Public: Store Research Question
 # ---------------------------------------------------------------------------
 
-def store_research_question(question: ResearchQuestion) -> str:
+def store_research_question(
+    question: ResearchQuestion,
+    embedding: Optional[list[float]] = None,
+) -> str:
     """
     Insert the framing research question into the `research_questions`
     table, keeping topic + question + created_at together for traceability.
+
+    When *embedding* is provided (embedding of topic + question), it is stored
+    in the ``embedding`` column so later runs can recognise the same topic or
+    question semantically. The vector column is nullable: old rows without an
+    embedding simply never match semantically (exact matches still work).
     Returns the generated UUID of the new row.
     """
     supabase = _get_supabase()
@@ -195,6 +235,8 @@ def store_research_question(question: ResearchQuestion) -> str:
         "status": question.status,
         "priority": question.priority,
     }
+    if embedding is not None:
+        row["embedding"] = _vector_literal(embedding)
 
     result = supabase.table("research_questions").insert(row).execute()
     question_id: str = result.data[0]["id"]
@@ -240,6 +282,304 @@ def store_research_sources(
 
     log.info("[Memory] Stored %d research source(s) for question_id=%s", len(source_ids), research_question_id)
     return source_ids
+
+
+# ---------------------------------------------------------------------------
+# Research-session memory (remember researched topics/questions)
+# ---------------------------------------------------------------------------
+
+def get_known_research_questions(limit: int = 200) -> list[dict]:
+    """
+    Fetch the most recent research_questions rows (id, topic, question,
+    status, embedding) so callers can recognise previously researched
+    topics/questions. Non-blocking: an unavailable store returns [].
+    """
+    try:
+        supabase = _get_supabase()
+        result = (
+            supabase.table("research_questions")
+            .select("id", "topic", "question", "status", "embedding")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return list(result.data or [])
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(
+            "[Memory] Could not load known research questions (%s: %s) – memory empty.",
+            type(exc).__name__, exc,
+        )
+        return []
+
+
+def _cosine(a, b) -> float:
+    """Cosine similarity between two embedding vectors (0.0 when unusable).
+
+    Embeddings are L2-normalized, so this is a plain dot product; the
+    normalization guard keeps ragged/empty inputs safe regardless.
+    """
+    try:
+        va = np.asarray(a, dtype=np.float64).reshape(-1)
+        vb = np.asarray(b, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return 0.0
+    if va.size == 0 or vb.size == 0 or va.size != vb.size:
+        return 0.0
+    denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
+    if denom == 0.0:
+        return 0.0
+    return float(np.dot(va, vb) / denom)
+
+
+def _as_similarity_embedding(value) -> Optional[list[float]]:
+    """Vector column value → list[float], handling both arrays and literals."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return None
+
+
+def check_topic_researched(
+    topic: str,
+    question: str,
+    threshold: Optional[float] = None,
+    use_embedding: bool = True,
+) -> dict:
+    """
+    Decide whether *topic* + *question* were already researched.
+
+    Two passes, both against the previously stored research sessions:
+
+    1. Exact pass (no network calls beyond the memory fetch): a session is a
+       duplicate when the SAME normalized topic AND question was asked, or the
+       SAME normalized question was asked (regardless of topic wording). An
+       equal topic with a *different* question is a follow-up, never a
+       duplicate – related but meaningfully different research is allowed.
+
+    2. Semantic pass (embedding cosine vs stored session embeddings): used
+       only when no exact match fired, so lightly reworded duplicates still
+       trip the memory while unrelated/follow-up questions stay below the
+       threshold.
+
+    Non-blocking: embedding or store failures degrade to "not matched"
+    (research proceeds) rather than halting the pipeline.
+
+    Parameters
+    ----------
+    topic / question : the proposed research topic and question.
+    threshold        : minimum cosine similarity for a semantic match
+                       (defaults to settings.RESEARCH_DUPLICATE_THRESHOLD).
+    use_embedding    : skip the semantic pass entirely when False (pure
+                       exact-text matching; deterministic, no API calls).
+
+    Returns
+    -------
+    dict with keys:
+        matched           : bool
+        reason            : "exact" | "semantic" | None
+        question_id       : UUID of the matched research session (None otherwise)
+        matched_question  : {id, topic, question, status} of the match (or None)
+        similarity        : best cosine found (None when no semantic pass ran)
+    """
+    result: dict = {
+        "matched": False,
+        "reason": None,
+        "question_id": None,
+        "matched_question": None,
+        "similarity": None,
+    }
+
+    try:
+        known = get_known_research_questions()
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(
+            "[Memory] Research-memory unavailable (%s: %s) – treating as new research.",
+            type(exc).__name__, exc,
+        )
+        return result
+    if not known:
+        return result
+
+    norm_topic = _normalize_research_text(topic)
+    norm_question = _normalize_research_text(question)
+
+    # ── Exact pass ────────────────────────────────────────────────────────
+    for row in known:
+        same_topic = bool(norm_topic) and _normalize_research_text(row.get("topic")) == norm_topic
+        same_question = bool(norm_question) and _normalize_research_text(row.get("question")) == norm_question
+        if same_topic and same_question:
+            result.update(
+                matched=True,
+                reason="exact",
+                question_id=row.get("id"),
+                matched_question={k: row.get(k) for k in ("id", "topic", "question", "status")},
+            )
+            return result
+        if same_question:
+            result.update(
+                matched=True,
+                reason="exact",
+                question_id=row.get("id"),
+                matched_question={k: row.get(k) for k in ("id", "topic", "question", "status")},
+            )
+            return result
+
+    # ── Semantic pass ─────────────────────────────────────────────────────
+    if not use_embedding:
+        return result
+
+    try:
+        query_embedding = get_normalized_embedding(f"{topic} {question}".strip())
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(
+            "[Memory] Embedding unavailable (%s) – skipping semantic research match.",
+            type(exc).__name__,
+        )
+        return result
+
+    t = float(threshold if threshold is not None else settings.RESEARCH_DUPLICATE_THRESHOLD)
+
+    best_sim = float("-inf")
+    best_row = None
+    for row in known:
+        value = _as_similarity_embedding(row.get("embedding"))
+        if value is None:
+            continue
+        sim = _cosine(query_embedding, value)
+        if sim > best_sim:
+            best_sim, best_row = sim, row
+
+    result["similarity"] = best_sim if best_row is not None else None
+    if best_row is not None and best_sim >= t:
+        result.update(
+            matched=True,
+            reason="semantic",
+            question_id=best_row.get("id"),
+            matched_question={k: best_row.get(k) for k in ("id", "topic", "question", "status")},
+        )
+    return result
+
+
+def get_research_sources_for_question(
+    research_question_id: Optional[str],
+) -> tuple[list[ResearchSource], list[str]]:
+    """
+    Hydrate the sources (+ their row UUIDs) recorded for a research session.
+
+    Used to *reuse* a remembered session: when a topic/question was already
+    researched, the stored sources come back without re-searching them.
+    Non-blocking: on store failure or unknown id, returns empty lists.
+    """
+    if not research_question_id:
+        return [], []
+
+    try:
+        supabase = _get_supabase()
+        result = (
+            supabase.table("research_sources")
+            .select("id", "url", "title", "body", "source", "published",
+                    "score", "source_type", "accessed_at")
+            .eq("research_question_id", research_question_id)
+            .order("score", desc=True)
+            .execute()
+        )
+        sources: list[ResearchSource] = []
+        ids: list[str] = []
+        for row in list(result.data or []):
+            row = dict(row)
+            row_id = row.pop("id", None)
+            sources.append(ResearchSource.from_dict(row))
+            ids.append(row_id)
+        return sources, ids
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(
+            "[Memory] Could not load sources for question %s (%s: %s).",
+            research_question_id, type(exc).__name__, exc,
+        )
+        return [], []
+
+
+def delete_research_question(research_question_id: Optional[str]) -> None:
+    """
+    Remove a research_questions row (its research_sources rows cascade).
+
+    Used to clean up a session that was created for a research run which
+    produced nothing persistable, so a dead/incomplete row never becomes a
+    reusable duplicate for a later run. Non-blocking: an unavailable store
+    only logs a warning (the caller keeps its in-memory result intact).
+    """
+    if not research_question_id:
+        return
+    try:
+        supabase = _get_supabase()
+        supabase.table("research_questions").delete().eq("id", research_question_id).execute()
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(
+            "[Memory] Could not delete research session %s (%s: %s).",
+            research_question_id, type(exc).__name__, exc,
+        )
+
+
+def get_known_source_urls() -> set[str]:
+    """
+    Normalized URLs already recorded in research_sources across all sessions.
+
+    Non-blocking: an unavailable store returns an empty set (callers then
+    persist everything, as today).
+    """
+    try:
+        supabase = _get_supabase()
+        result = supabase.table("research_sources").select("url").execute()
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(
+            "[Memory] Could not load known source URLs (%s: %s) – skipping cross-session source dedup.",
+            type(exc).__name__, exc,
+        )
+        return set()
+
+    known: set[str] = set()
+    for row in list(result.data or []):
+        url = (row.get("url") or "").strip()
+        if not url:
+            continue
+        known.add(_normalize_url(url) or url)
+    return known
+
+
+def filter_repeated_sources(
+    sources: list[ResearchSource],
+    known_urls: Optional[set] = None,
+) -> tuple[list[ResearchSource], list[ResearchSource]]:
+    """
+    Split *sources* into fresh vs already-known by normalized URL.
+
+    "Known" means either previously stored across earlier sessions (pass in
+    the result of :func:`get_known_source_urls`) or repeated within this
+    batch (first occurrence wins). Pure function – no I/O.
+
+    Returns ``(to_store, repeated)`` where *repeated* keeps the exact source
+    objects so callers can log/measure them without losing the in-memory
+    research result.
+    """
+    known = set(known_urls or set())
+    seen: set[str] = set()
+    to_store: list[ResearchSource] = []
+    repeated: list[ResearchSource] = []
+
+    for source in sources:
+        norm = _normalize_url(source.url) or source.url
+        key = norm.casefold()
+        if key in known or key in seen:
+            repeated.append(source)
+            continue
+        seen.add(key)
+        to_store.append(source)
+
+    return to_store, repeated
 
 
 # ---------------------------------------------------------------------------

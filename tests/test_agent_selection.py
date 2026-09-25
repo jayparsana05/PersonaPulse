@@ -147,5 +147,55 @@ class RunSelectionTest(unittest.TestCase):
         store.assert_called_once()
 
 
+class RunSelectionResearchMemoryTest(unittest.TestCase):
+    """run_selection(check_researched=True) remembers previously researched
+    topics/questions and never duplicates a research session."""
+
+    def _setup(self, dup_response):
+        topics = [candidate()]
+        selection = selection_for(topics[0])
+        question = question_for(topics[0])
+        return topics, selection, question
+
+    def _run(self, dup_response, store_id="qid-2"):
+        topics, selection, question = self._setup(dup_response)
+        with patch("src.agent.discover_topic_candidates", return_value=topics), \
+             patch("src.agent.select_topic", return_value=selection), \
+             patch("src.agent.frame_question", return_value=question), \
+             patch("src.agent.check_topic_researched", return_value=dup_response) as check, \
+             patch("src.agent.store_research_question", return_value=store_id) as store:
+            result = run_selection(query="agentic AI", limit=5, candidates=topics, check_researched=True)
+        return result, check, store
+
+    def test_exact_duplicate_reuses_existing_session(self):
+        dup = {
+            "matched": True, "reason": "exact", "question_id": "qid-existing",
+            "matched_question": {"id": "qid-existing"}, "similarity": None,
+        }
+        result, check, store = self._run(dup)
+        self.assertTrue(result["already_researched"])
+        self.assertEqual(result["research_question_id"], "qid-existing")
+        store.assert_not_called()
+
+    def test_new_topic_stores_and_marks_not_researched(self):
+        dup = {
+            "matched": False, "reason": None, "question_id": None,
+            "matched_question": None, "similarity": None,
+        }
+        result, check, store = self._run(dup)
+        self.assertFalse(result["already_researched"])
+        self.assertEqual(result["research_question_id"], "qid-2")
+        store.assert_called_once()
+
+    def test_follow_up_different_question_is_allowed(self):
+        dup = {
+            "matched": False, "reason": None, "question_id": None,
+            "matched_question": None, "similarity": 0.4,
+        }
+        result, _, store = self._run(dup)
+        self.assertFalse(result["already_researched"])
+        store.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

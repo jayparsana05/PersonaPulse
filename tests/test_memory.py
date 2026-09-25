@@ -34,7 +34,17 @@ _REQUIRED_ENV = {
 for _key, _value in _REQUIRED_ENV.items():
     os.environ.setdefault(_key, _value)
 
-from src.memory import store_draft, store_research_question, store_research_sources  # noqa: E402
+from src.memory import (  # noqa: E402
+    check_topic_researched,
+    delete_research_question,
+    filter_repeated_sources,
+    get_known_research_questions,
+    get_known_source_urls,
+    get_research_sources_for_question,
+    store_draft,
+    store_research_question,
+    store_research_sources,
+)
 from src.models import ResearchQuestion, ResearchSource  # noqa: E402
 
 
@@ -49,6 +59,8 @@ class FakeSupabase:
         self.table_name = None
         self.row = None
         self.rows = []
+        self.deleted_table = None
+        self.deleted_filter = None
 
     def table(self, name):
         self.table_name = name
@@ -57,6 +69,14 @@ class FakeSupabase:
     def insert(self, row):
         self.row = row
         self.rows.append(row)
+        return self
+
+    def delete(self):
+        self.deleted_table = self.table_name
+        return self
+
+    def eq(self, col, val):
+        self.deleted_filter = (col, val)
         return self
 
     def execute(self):
@@ -221,6 +241,294 @@ class StoreResearchSourcesTest(unittest.TestCase):
         ids = self._store(self._sources(2))
         self.assertEqual(len(ids), 2)
         self.assertTrue(all(i == FakeResult.data[0]["id"] for i in ids))
+
+
+class FakeResultWithData:
+    def __init__(self, data):
+        self.data = data
+
+
+class FakeSelectableSupabase:
+    """Chainable fake supporting select/order/limit/eq/execute for reads."""
+
+    def __init__(self, result_rows):
+        self._result_rows = result_rows
+        self.table_name = None
+        self.calls = []
+
+    def table(self, name):
+        self.table_name = name
+        return self
+
+    def select(self, *cols):
+        self.calls.append(("select", cols))
+        return self
+
+    def order(self, col, desc=False):
+        self.calls.append(("order", col, desc))
+        return self
+
+    def limit(self, n):
+        self.calls.append(("limit", n))
+        return self
+
+    def eq(self, col, val):
+        self.calls.append(("eq", col, val))
+        return self
+
+    def execute(self):
+        return FakeResultWithData(self._result_rows)
+
+
+KNOWN_SESSIONS = [
+    {
+        "id": "qid-1",
+        "topic": "Agentic orchestration",
+        "question": "Which orchestration framework scales best?",
+        "status": "answered",
+        "embedding": [1.0, 0.0],
+    },
+    {
+        "id": "qid-2",
+        "topic": "Memory for agents",
+        "question": "How should agent memory be managed?",
+        "status": "proposed",
+        "embedding": [0.0, 1.0],
+    },
+]
+
+
+class CheckTopicResearchedTest(unittest.TestCase):
+    """Research-session memory: exact + semantic duplicate detection."""
+
+    def _check(self, topic, question, **kwargs):
+        with patch("src.memory.get_known_research_questions", return_value=KNOWN_SESSIONS), \
+             patch("src.memory.get_normalized_embedding") as embed:
+            result = check_topic_researched(topic, question, **kwargs)
+        return result, embed
+
+    def test_exact_duplicate_topic_and_question_is_matched(self):
+        result, _ = self._check(
+            "Agentic  orchestration",
+            "Which orchestration framework scales best?",
+            use_embedding=False,
+        )
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["reason"], "exact")
+        self.assertEqual(result["question_id"], "qid-1")
+
+    def test_duplicate_question_is_matched_regardless_of_topic_wording(self):
+        result, _ = self._check(
+            "Scaling agentic AI (reworded topic)",
+            "which orchestration framework scales best?",
+            use_embedding=False,
+        )
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["reason"], "exact")
+        self.assertEqual(result["question_id"], "qid-1")
+
+    def test_related_but_different_question_is_not_a_duplicate(self):
+        """Same topic family, meaningfully different question → follow-up allowed."""
+        result, _ = self._check(
+            "Agentic orchestration",
+            "What are the cost implications of agent orchestration?",
+            use_embedding=False,
+        )
+        self.assertFalse(result["matched"])
+        self.assertIsNone(result["reason"])
+        self.assertIsNone(result["question_id"])
+
+    def test_unrelated_topic_and_question_is_not_a_duplicate(self):
+        result, _ = self._check(
+            "RAG evaluation",
+            "What is the best evaluation harness for retrieval pipelines?",
+            use_embedding=False,
+        )
+        self.assertFalse(result["matched"])
+
+    def test_empty_known_sessions_never_match(self):
+        with patch("src.memory.get_known_research_questions", return_value=[]):
+            result = check_topic_researched(
+                "A", "B", use_embedding=False,
+            )
+        self.assertFalse(result["matched"])
+
+    def test_semantic_match_above_threshold(self):
+        with patch("src.memory.get_known_research_questions", return_value=KNOWN_SESSIONS), \
+             patch("src.memory.get_normalized_embedding", return_value=[1.0, 0.0]):
+            result = check_topic_researched(
+                "Scaling production agents",
+                "What is the most scalable orchestration framework?",
+            )
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["reason"], "semantic")
+        self.assertEqual(result["question_id"], "qid-1")
+        self.assertGreaterEqual(result["similarity"], 0.88)
+
+    def test_semantic_similarity_below_threshold_allows_follow_up(self):
+        with patch("src.memory.get_known_research_questions", return_value=KNOWN_SESSIONS), \
+             patch("src.memory.get_normalized_embedding", return_value=[-1.0, 0.0]):
+            result = check_topic_researched(
+                "Scaling production agents",
+                "What is the most scalable orchestration framework?",
+            )
+        self.assertFalse(result["matched"])
+        self.assertIsNone(result["reason"])
+        self.assertIsNotNone(result["similarity"])
+
+    def test_memory_store_failure_is_non_blocking(self):
+        with patch("src.memory.get_known_research_questions", side_effect=RuntimeError("db down")):
+            result = check_topic_researched("A", "B", use_embedding=False)
+        self.assertFalse(result["matched"])
+
+    def test_embedding_failure_falls_back_to_exact_only(self):
+        with patch("src.memory.get_known_research_questions", return_value=KNOWN_SESSIONS), \
+             patch("src.memory.get_normalized_embedding", side_effect=RuntimeError("gemini down")):
+            result = check_topic_researched(
+                "RAG evaluation", "What is the best evaluation harness?", use_embedding=True,
+            )
+        self.assertFalse(result["matched"])
+
+
+class GetKnownResearchQuestionsTest(unittest.TestCase):
+    def test_returns_rows_from_research_questions(self):
+        rows = [KNOWN_SESSIONS[0]]
+        fake = FakeSelectableSupabase(rows)
+        with patch("src.memory._get_supabase", return_value=fake):
+            known = get_known_research_questions(limit=20)
+        self.assertEqual(known, rows)
+        self.assertEqual(fake.table_name, "research_questions")
+
+    def test_store_failure_returns_empty(self):
+        fake = FakeSelectableSupabase([])
+        with patch("src.memory._get_supabase", side_effect=RuntimeError("db down")):
+            known = get_known_research_questions()
+        self.assertEqual(known, [])
+
+
+class StoreResearchQuestionMemoryTest(unittest.TestCase):
+    def test_optional_embedding_is_stored_as_pgvector_literal(self):
+        fake = FakeSupabase()
+        question = ResearchQuestion(topic="T", question="Q?", aspects=[])
+        with patch("src.memory._get_supabase", return_value=fake):
+            store_research_question(question, embedding=[0.1, 0.2])
+        self.assertEqual(fake.row["embedding"], "[0.10000000,0.20000000]")
+
+    def test_without_embedding_no_vector_column_is_sent(self):
+        fake = FakeSupabase()
+        question = ResearchQuestion(topic="T", question="Q?", aspects=[])
+        with patch("src.memory._get_supabase", return_value=fake):
+            store_research_question(question)
+        self.assertNotIn("embedding", fake.row)
+
+
+class GetResearchSourcesForQuestionTest(unittest.TestCase):
+    def test_hydrates_sources_and_ids_for_a_session(self):
+        row = {
+            "id": "src-1",
+            "url": "https://ex.com/a",
+            "title": "Source A",
+            "body": "Body.",
+            "source": "ex.com",
+            "published": "2026-09-19",
+            "score": 0.9,
+            "source_type": "secondary",
+            "accessed_at": "2026-09-19T10:00:00+00:00",
+        }
+        fake = FakeSelectableSupabase([row])
+        with patch("src.memory._get_supabase", return_value=fake):
+            sources, ids = get_research_sources_for_question("qid-1")
+        self.assertEqual(ids, ["src-1"])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].url, "https://ex.com/a")
+
+    def test_no_question_id_returns_empty(self):
+        with patch("src.memory._get_supabase") as sb:
+            sources, ids = get_research_sources_for_question("")
+        sb.assert_not_called()
+        self.assertEqual((sources, ids), ([], []))
+
+    def test_store_failure_returns_empty(self):
+        with patch("src.memory._get_supabase", side_effect=RuntimeError("db down")):
+            sources, ids = get_research_sources_for_question("qid-1")
+        self.assertEqual((sources, ids), ([], []))
+
+
+class GetKnownSourceUrlsTest(unittest.TestCase):
+    def test_returns_normalized_known_urls(self):
+        fake = FakeSelectableSupabase([
+            {"url": "https://www.Example.com/a/?utm_source=x#frag"},
+            {"url": "https://ex.com/b"},
+            {"url": ""},
+        ])
+        with patch("src.memory._get_supabase", return_value=fake):
+            known = get_known_source_urls()
+        self.assertIn("https://example.com/a", known)
+        self.assertIn("https://ex.com/b", known)
+
+    def test_store_failure_returns_empty_set(self):
+        with patch("src.memory._get_supabase", side_effect=RuntimeError("db down")):
+            known = get_known_source_urls()
+        self.assertEqual(known, set())
+
+
+class FilterRepeatedSourcesTest(unittest.TestCase):
+    def _source(self, url):
+        return ResearchSource(url=url, title="T", body="B")
+
+    def test_fresh_sources_all_pass(self):
+        sources = [self._source("https://ex.com/1"), self._source("https://ex.com/2")]
+        to_store, repeated = filter_repeated_sources(sources, known_urls=set())
+        self.assertEqual(len(to_store), 2)
+        self.assertEqual(repeated, [])
+
+    def test_known_source_is_flagged_repeated(self):
+        sources = [self._source("https://ex.com/1"), self._source("https://ex.com/2")]
+        to_store, repeated = filter_repeated_sources(sources, known_urls={"https://ex.com/1"})
+        self.assertEqual([s.url for s in to_store], ["https://ex.com/2"])
+        self.assertEqual([s.url for s in repeated], ["https://ex.com/1"])
+
+    def test_repeat_within_batch_keeps_first_occurrence(self):
+        sources = [
+            self._source("https://ex.com/a"),
+            self._source("https://ex.com/a"),
+            self._source("https://ex.com/b"),
+        ]
+        to_store, repeated = filter_repeated_sources(sources, known_urls=set())
+        self.assertEqual([s.url for s in to_store], ["https://ex.com/a", "https://ex.com/b"])
+        self.assertEqual([s.url for s in repeated], ["https://ex.com/a"])
+
+    def test_known_normalized_equivalent_url_is_repeated(self):
+        sources = [self._source("https://www.example.com/a/?utm_source=rss#top")]
+        to_store, repeated = filter_repeated_sources(sources, known_urls={"https://example.com/a"})
+        self.assertEqual(to_store, [])
+        self.assertEqual(len(repeated), 1)
+
+
+class DeleteResearchQuestionTest(unittest.TestCase):
+    """delete_research_question removes the session row (sources cascade)."""
+
+    def test_deletes_from_research_questions(self):
+        fake = FakeSupabase()
+        with patch("src.memory._get_supabase", return_value=fake):
+            delete_research_question("qid-1")
+        self.assertEqual(fake.deleted_table, "research_questions")
+
+    def test_filters_on_row_id(self):
+        fake = FakeSupabase()
+        with patch("src.memory._get_supabase", return_value=fake):
+            delete_research_question("qid-1")
+        self.assertEqual(fake.deleted_filter, ("id", "qid-1"))
+
+    def test_no_id_does_not_touch_the_store(self):
+        with patch("src.memory._get_supabase") as sb:
+            delete_research_question("")
+            delete_research_question(None)
+        sb.assert_not_called()
+
+    def test_store_failure_is_non_blocking(self):
+        with patch("src.memory._get_supabase", side_effect=RuntimeError("db down")):
+            delete_research_question("qid-1")
 
 
 if __name__ == "__main__":
